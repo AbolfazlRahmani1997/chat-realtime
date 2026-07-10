@@ -1,0 +1,363 @@
+{
+  "info": {
+    "_postman_id": "a9d5f81e-0f9a-4f73-9866-a4495f8f4c9a",
+    "name": "Chat Service API + Unified WS",
+    "description": "REST and WebSocket requests for chat-service frontend integration.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "REST API",
+      "item": [
+        {
+          "name": "Create Room",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Id\": \"room-abc\",\n  \"Name\": \"اتاق تست\",\n  \"Member\": [\n    {\n      \"Id\": \"123\",\n      \"Notification\": true,\n      \"Pin\": false\n    },\n    {\n      \"Id\": \"10\",\n      \"Notification\": true,\n      \"Pin\": false\n    }\n  ],\n  \"Owner\": [\"123\"],\n  \"Writer\": [\"123\", \"10\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/chat/ws/createRoom",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "ws",
+                "createRoom"
+              ]
+            },
+            "description": "Create a chat room."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Me",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/chat/me?token={{token}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "me"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Get current user based on token."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Room Clients",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/chat/ws/getClients/{{room_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "ws",
+                "getClients",
+                "{{room_id}}"
+              ]
+            },
+            "description": "List online clients in a room."
+          },
+          "response": []
+        },
+        {
+          "name": "Toggle Room Pin",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "{{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chat/room/pin/{{room_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "room",
+                "pin",
+                "{{room_id}}"
+              ]
+            },
+            "description": "Toggle pin status for current user in room."
+          },
+          "response": []
+        },
+        {
+          "name": "Toggle Room Notification",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "{{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chat/room/notification/{{room_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "room",
+                "notification",
+                "{{room_id}}"
+              ]
+            },
+            "description": "Toggle notification status for current user in room."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Mock Users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/chat/mock-users",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chat",
+                "mock-users"
+              ]
+            },
+            "description": "Get mock users and tokens (when mock mode enabled)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "WebSocket - Unified",
+      "item": [
+        {
+          "name": "WS Connect (Unified)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Open WebSocket connection. First server event should be: {\"event_type\":\"init\",\"content\":[...],\"current_user_id\":\"...\"}"
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: listRooms",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "After opening the socket, send this frame manually in Postman WS panel:\n{\n  \"event_type\": \"listRooms\",\n  \"item\": \"1\"\n}\nExpected event: event_type=listRooms (note: server uses Content with capital C)."
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: joinRoom",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Send frame:\n{\n  \"event_type\": \"joinRoom\",\n  \"room_id\": \"{{room_id}}\",\n  \"page\": \"1\"\n}\nExpected event: event_type=roomHistory."
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: sendMessage",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Send frame:\n{\n  \"event_type\": \"sendMessage\",\n  \"room_id\": \"{{room_id}}\",\n  \"ulid\": \"{{message_ulid}}\",\n  \"content\": \"سلام از فرانت\"\n}\nExpected ack: event_type=deliverMessage.\nExpected broadcast: event_type=roomMessage."
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: seenMessage",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Send frame:\n{\n  \"event_type\": \"seenMessage\",\n  \"item\": \"{{message_ulid}}\"\n}\nExpected notify to peer: event_type=seenMessage."
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: leaveRoom",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Send frame:\n{\n  \"event_type\": \"leaveRoom\",\n  \"room_id\": \"{{room_id}}\"\n}"
+          },
+          "response": []
+        },
+        {
+          "name": "WS Send: ping",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{ws_base}}/chat/ws?token={{token}}",
+              "host": [
+                "{{ws_base}}"
+              ],
+              "path": [
+                "chat",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Send frame:\n{\n  \"event_type\": \"ping\"\n}\nExpected ack: {\"event_type\":\"deliverMessage\",\"Content\":\"ping\"}"
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "ws_base",
+      "value": "ws://localhost:8080"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "room_id",
+      "value": "room-abc"
+    },
+    {
+      "key": "message_ulid",
+      "value": "01JTESTULID0000000000000"
+    }
+  ]
+}

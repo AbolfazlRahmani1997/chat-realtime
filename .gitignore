@@ -1,0 +1,10 @@
+./venv
+.idea
+.idea/
+.env
+.go.mod
+
+# web (React)
+web/node_modules
+web/dist
+

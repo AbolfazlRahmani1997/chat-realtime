@@ -1,0 +1,15 @@
+branch_name:
+  stage: lint
+  script: 
+    - |
+      if expr "$CI_COMMIT_BRANCH" : '^\(feature\|feat\|hotfix\|fix\|refactor\|style\|test\|doc\|docs\|chore\)\/.*$' >/dev/null; then
+        echo "Branch name convention is valid."
+      else
+        echo "Invalid branch name convention."
+        exit 1  # Exit with an error if the branch name is invalid
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always

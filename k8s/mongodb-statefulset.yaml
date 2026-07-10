@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chat-shanakht-dev
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+  namespace: chat-shanakht-dev
+type: Opaque
+stringData:
+  MONGO_INITDB_ROOT_USERNAME: "root"
+  MONGO_INITDB_ROOT_PASSWORD: "root_password_123"
+  MONGO_INITDB_DATABASE: "chat_db_dev"
+  MONGO_USER: "chat_user_dev"
+  MONGO_PASSWORD: "dev_password"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: chat-shanakht-dev
+  labels:
+    app: mongodb
+spec:
+  selector:
+    app: mongodb
+  ports:
+    - port: 27017
+      targetPort: 27017
+      name: mongo
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: chat-shanakht-dev
+spec:
+  serviceName: mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:4.4
+          ports:
+            - containerPort: 27017
+              name: mongo
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-secret
+                  key: MONGO_INITDB_ROOT_USERNAME
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-secret
+                  key: MONGO_INITDB_ROOT_PASSWORD
+            - name: MONGO_INITDB_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-secret
+                  key: MONGO_INITDB_DATABASE
+            - name: MONGO_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-secret
+                  key: MONGO_USER
+            - name: MONGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-secret
+                  key: MONGO_PASSWORD
+          command:
+            - bash
+            - -c
+            - |
+              mongod --bind_ip_all --replSet rs0 &
+              until mongosh --eval "print(\"waited for connection\")" > /dev/null 2>&1; do
+                sleep 2
+              done
+              mongosh --eval "
+                rs.initiate({
+                  _id: \"rs0\",
+                  members: [{ _id: 0, host: \"mongodb-0.mongodb.chat-shanakht-dev.svc.cluster.local:27017\" }]
+                });
+                admin = db.getSiblingDB(\"admin\");
+                admin.createUser({
+                  user: \"$MONGO_INITDB_ROOT_USERNAME\",
+                  pwd: \"$MONGO_INITDB_ROOT_PASSWORD\",
+                  roles: [\"root\"]
+                });
+                db = db.getSiblingDB(\"$MONGO_INITDB_DATABASE\");
+                db.createUser({
+                  user: \"$MONGO_USER\",
+                  pwd: \"$MONGO_PASSWORD\",
+                  roles: [\"readWrite\"]
+                });
+              "
+              wait
+          livenessProbe:
+            exec:
+              command:
+                - mongosh
+                - --eval
+                - "db.adminCommand('ping')"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --eval
+                - "db.adminCommand('ping')"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: mongodb-data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

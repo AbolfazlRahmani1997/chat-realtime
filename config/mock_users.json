@@ -1,0 +1,23 @@
+{
+  "dev-token-user1": {
+    "id": 1,
+    "firstname": "کاربر",
+    "lastname": "اول",
+    "username": "user1",
+    "avatar": ""
+  },
+  "dev-token-user2": {
+    "id": 2,
+    "firstname": "کاربر",
+    "lastname": "دوم",
+    "username": "user2",
+    "avatar": ""
+  },
+  "dev-token-user3": {
+    "id": 3,
+    "firstname": "کاربر",
+    "lastname": "سوم",
+    "username": "user3",
+    "avatar": ""
+  }
+}

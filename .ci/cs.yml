@@ -1,0 +1,21 @@
+cs:
+  stage: lint
+  image:
+    name: golang:1.22-alpine
+  script:
+    - |
+      issues=$(gofmt -l -s .)
+      if [ -n "$issues" ]; then
+        gofmt -s -d .
+        echo -e "\n -----------------------------------------------------------------------------"
+        echo -e "| To resolve the issue, please execute the following command: \x1B[96m gofmt -w -s . \x1B[0m |"
+        echo -e " -----------------------------------------------------------------------------\n"
+        exit 1
+      else
+        echo "No style issues found with gofmt."
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always

@@ -1,0 +1,42 @@
+.deploy_helm:
+  stage: deploy
+  script:
+    - mkdir -p .helm
+    - curl -o .helm/${CHART_TGZ} --user anything:${gitlab_access_token} ${CI_API_V4_URL}/projects/${HELM_PROJECT_ID}/packages/helm/stable/charts/${CHART_TGZ}
+    - tar zxvf .helm/${CHART_TGZ} -C .helm
+
+    - chmod +x .config/vault.sh
+    - .config/vault.sh "${MY_VAULT_TOKEN}" "${MY_VAULT_ADDR}" "${project_name}" "${values_version}" .helm/helm_value.yml
+    
+    - mkdir -p $HOME/.kube
+    - echo ${config} | base64 -d > $HOME/.kube/config
+
+    - helm upgrade --install ${project_name} -n ${project_name} .helm/$CHART_NAME -f .helm/helm_value.yml --set app.tag=$CI_COMMIT_SHA
+  when: manual
+
+deploy_dev:
+  extends: .deploy_helm
+  variables:
+    values_version: ${dev_values_version}
+    project_name: chat-dev
+    config: "${kube_config_demo}"
+  only:
+    - develop
+
+deploy_test:
+  extends: .deploy_helm
+  variables:
+    values_version: ${test_values_version}
+    project_name: chat-test
+    config: "${kube_config_demo}"
+  only:
+    - master
+
+deploy_prod:
+  extends: .deploy_helm
+  variables:
+    values_version: ${prod_values_version}
+    project_name: chat-prod
+    config: "${kube_config_demo}"
+  only:
+    - master

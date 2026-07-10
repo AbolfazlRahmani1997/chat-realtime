@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: scylla-cluster
+  labels:
+    app: scylla
+spec:
+  ports:
+    - port: 9042
+      targetPort: 9042
+      name: cql
+    - port: 9160
+      targetPort: 9160
+      name: thrift
+  clusterIP: None
+  selector:
+    app: scylla
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: scylla
+spec:
+  serviceName: scylla-cluster
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scylla
+  template:
+    metadata:
+      labels:
+        app: scylla
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: scylla
+          image: scylladb/scylla:4.6
+          args:
+            - "--smp"
+            - "1"
+            - "--memory"
+            - "1G"
+            - "--overprovisioned"
+            - "1"
+            - "--developer-mode"
+            - "1"
+            - "--broadcast-address"
+            - "$(POD_IP)"
+            - "--broadcast-rpc-address"
+            - "$(POD_IP)"
+            - "--seed-provider-parameters"
+            - "seeds=scylla-0.scylla-cluster"
+          ports:
+            - containerPort: 9042
+              name: cql
+            - containerPort: 9160
+              name: thrift
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 2Gi
+          volumeMounts:
+            - name: scylla-data
+              mountPath: /var/lib/scylla
+  volumeClaimTemplates:
+    - metadata:
+        name: scylla-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

@@ -1,0 +1,25 @@
+stages:
+  - build
+
+variables:
+  REGISTRY: 109.122.247.10:5000
+  IMAGE_NAME: chat-shanakht-app
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  
+  # تنظیمات Go mirror
+  GOPROXY: "https://mirror.abrha.net/repository/go/,direct"
+  GOSUMDB: "off"
+  GO111MODULE: "on"
+
+build-image:
+  stage: build
+  tags:
+    - deploy
+  script:
+    - echo "Setting up Go environment..."
+
+    - echo "Building Docker image..."
+    - docker build --build-arg GOPROXY=${GOPROXY} --build-arg GOSUMDB=${GOSUMDB} -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
+    - docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+  only:
+    - main

@@ -1,0 +1,108 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  REGISTRY: registry.meetpeet.ir
+  IMAGE_NAME: chat-shanakht-app
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+
+  DEV_NAMESPACE: chat-shanakht-dev
+  PROD_NAMESPACE: chat-shanakht
+
+  GOPROXY: "https://mirror.abrha.net/repository/go/,direct"
+  GOSUMDB: "off"
+  GO111MODULE: "on"
+
+build-image:
+  stage: build
+  tags:
+    - deploy
+  script:
+    - |
+      echo "Building Docker image..."
+      docker build --build-arg GOPROXY=${GOPROXY} --build-arg GOSUMDB=${GOSUMDB} -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
+      docker tag ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY}/${IMAGE_NAME}:latest
+      docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+      docker push ${REGISTRY}/${IMAGE_NAME}:latest
+  only:
+    - main
+    - develop
+  when: manual
+
+.deploy-template: &deploy-template
+  stage: deploy
+  tags:
+    - k3s
+  script:
+    - |
+      kubectl get namespace ${NAMESPACE} || kubectl create namespace ${NAMESPACE}
+
+      # Create ConfigMap from env file
+      kubectl delete configmap chat-env -n ${NAMESPACE} 2>/dev/null || true
+      kubectl create configmap chat-env --from-env-file=k8s/${ENV_FILE} -n ${NAMESPACE}
+
+      # Apply manifests
+      kubectl apply -f k8s/redis.yaml -n ${NAMESPACE} 2>/dev/null || echo "Redis already exists"
+      kubectl apply -f k8s/${MANIFEST}
+
+      # Update image
+      kubectl set image deployment/chat-shanakht app=${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} -n ${NAMESPACE}
+      kubectl rollout status deployment/chat-shanakht -n ${NAMESPACE} --timeout=3m
+      kubectl get pods -n ${NAMESPACE}
+      kubectl get svc -n ${NAMESPACE}
+
+deploy-dev:
+  <<: *deploy-template
+  variables:
+    NAMESPACE: ${DEV_NAMESPACE}
+    ENV_FILE: env.dev
+    MANIFEST: chat-shanakht-dev.yaml
+  environment:
+    name: development
+    url: http://YOUR_NODE_IP:30080
+  only:
+    - develop
+  when: manual
+
+deploy-prod:
+  <<: *deploy-template
+  variables:
+    NAMESPACE: ${PROD_NAMESPACE}
+    ENV_FILE: env.prod
+    MANIFEST: chat-shanakht.yaml
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
+
+deploy-mongo:
+  stage: deploy
+  tags:
+    - k3s
+  script:
+    - |
+      kubectl apply -f k8s/mongo.yaml -n ${NAMESPACE}
+      echo "Waiting for MongoDB to be ready..."
+      kubectl rollout status statefulset/mongo -n ${NAMESPACE} --timeout=5m
+  variables:
+    NAMESPACE: ${DEV_NAMESPACE}
+  only:
+    - develop
+  when: manual
+
+deploy-scylla:
+  stage: deploy
+  tags:
+    - k3s
+  script:
+    - |
+      kubectl apply -f k8s/scylla.yaml -n ${NAMESPACE}
+      echo "Waiting for ScyllaDB cluster to be ready..."
+      kubectl rollout status statefulset/scylla -n ${NAMESPACE} --timeout=5m
+  variables:
+    NAMESPACE: ${DEV_NAMESPACE}
+  only:
+    - develop
+  when: manual
