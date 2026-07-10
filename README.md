@@ -1,310 +1,409 @@
 # Chat Service
 
-سرویس چت real-time مبتنی بر WebSocket با پشتیبانی از اتاق‌های گروهی، تحویل و خوانده‌شدن پیام، و یکپارچه‌سازی با صف RabbitMQ و سرویس احراز هویت (Gateway).
+Real-time WebSocket-based chat service with room management, message delivery/read receipts, file sharing, presence tracking, and horizontal scaling support. Built in Go with a hexagonal architecture.
 
 ---
 
-## فهرست
+## Table of Contents
 
-- [معماری و تکنولوژی](#معماری-و-تکنولوژی)
-- [پیش‌نیازها](#پیش‌نیازها)
-- [متغیرهای محیطی](#متغیرهای-محیطی)
-- [اجرا](#اجرا)
-- [API و WebSocket](#api-و-websocket)
-- [یکپارچه‌سازی با سیستم شما](#یکپارچه‌سازی-با-سیستم-شما)
-- [Docker](#docker)
-
----
-
-## معماری و تکنولوژی
-
-| بخش | تکنولوژی |
-|-----|----------|
-| Runtime | Go 1.19+ |
-| HTTP/WebSocket | Gin |
-| دیتابیس اصلی | MongoDB |
-| کش / صف | Redis |
-| صف رویداد (اتاق جدید) | RabbitMQ |
-| پروتکل چت | WebSocket (Gorilla) |
-
-**جریان کلی:**
-
-- کاربر با **توکن** (از Gateway شما) به endpointهای WebSocket وصل می‌شود.
-- **اتاق‌ها** یا از طریق API (`POST /chat/ws/createRoom`) ساخته می‌شوند یا با ارسال پیام به **RabbitMQ** در سرویس چت سینک می‌شوند.
-- پیام‌ها در MongoDB ذخیره و روی WebSocket به کلاینتهای همان اتاق broadcast می‌شوند.
-- وضعیت **تحویل (Deliver)** و **خوانده‌شدن (Read)** برای هر پیام نگهداری می‌شود.
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Prerequisites](#prerequisites)
+- [Environment Variables](#environment-variables)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [WebSocket Protocol](#websocket-protocol)
+- [Integration Guide](#integration-guide)
+- [Deployment](#deployment)
 
 ---
 
-## پیش‌نیازها
+## Architecture
 
-- **Go 1.19** (برای اجرای محلی)
-- **MongoDB** (با احراز هویت)
+### High-Level Design
+
+```
+┌─────────────┐     ┌──────────────────────────────────────────────┐
+│   Client    │────▶│              Gin HTTP Server                 │
+│ (Web/Mobile)│     │  ┌──────────┐  ┌──────────┐  ┌───────────┐  │
+└─────────────┘     │  │ REST API │  │  Admin   │  │ WebSocket │  │
+                    │  │  Routes  │  │  Routes  │  │  Upgrade  │  │
+                    │  └────┬─────┘  └────┬─────┘  └─────┬─────┘  │
+                    └───────┼──────────────┼──────────────┼────────┘
+                            │              │              │
+                            ▼              ▼              ▼
+                    ┌──────────────────────────────────────────┐
+                    │              Hub (In-Memory)              │
+                    │  ┌─────────┐ ┌──────────┐ ┌───────────┐  │
+                    │  │  Rooms  │ │  Users   │ │  Clients  │  │
+                    │  │ Manager │ │  Pool    │ │  Manager  │  │
+                    │  └────┬────┘ └────┬─────┘ └─────┬─────┘  │
+                    └───────┼───────────┼──────────────┼────────┘
+                            │           │              │
+        ┌───────────────────┼───────────┼──────────────┼──────────────┐
+        │                   │           │              │              │
+        ▼                   ▼           ▼              ▼              ▼
+┌──────────────┐   ┌─────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│   MongoDB /  │   │  Redis      │ │  Kafka   │ │RabbitMQ │ │  MinIO   │
+│   ScyllaDB   │   │(Cache/PubSub│ │(Messages)│ │ (Rooms) │ │ (Files)  │
+│  (Messages,  │   │ /Presence)  │ │          │ │         │ │          │
+│   Rooms,     │   └─────────────┘ └──────────┘ └──────────┘ └──────────┘
+│   Users)     │
+└──────────────┘
+```
+
+### Architectural Pattern: Hexagonal (Ports & Adapters)
+
+The codebase follows a **hexagonal architecture** with clear separation between domain logic, ports, and adapters:
+
+| Layer | Directory | Responsibility |
+|-------|-----------|----------------|
+| **Domain** | `internal/ws/`, `internal/core/domain/` | Core entities (Room, Message, User, Client), Hub (in-memory state machine) |
+| **Ports** | `ports/`, `internal/core/ports/` | Interfaces for repositories, services, and message brokers |
+| **Adapters** | `adapters/`, `internal/adapters/` | Concrete implementations: MongoDB, ScyllaDB, Kafka producer/consumer, RabbitMQ, MinIO |
+| **Handlers** | `router/`, `internal/admin/`, `internal/ws/ws_handler.go` | HTTP/WS route handlers (Gin) |
+| **Config** | `config/`, root `.env` | Environment variables, mock users |
+
+### Data Flow
+
+#### Message Lifecycle
+
+```
+Client A ──sendMessage──▶ Hub (in-memory) ──broadcast──▶ Clients in Room B
+                                │
+                          ┌─────┴──────┐
+                          ▼            ▼
+                      Kafka         Redis Pub/Sub
+                   (async persist)   (cross-instance)
+                          │
+                          ▼
+                    MongoDB/ScyllaDB
+                          │
+                          ▼
+                    Ntfy.sh (push notification to offline users)
+```
+
+#### Room Creation
+
+```
+External Service ──RabbitMQ──▶ Chat Service ──▶ MongoDB ──▶ WebSocket notification to online users
+       OR
+HTTP POST /chat/api/createRoom ──▶ Chat Service (direct)
+```
+
+### Horizontal Scaling
+
+```
+┌───────────┐  ┌───────────┐  ┌───────────┐
+│ Server 1  │  │ Server 2  │  │ Server 3  │
+│   Hub     │  │   Hub     │  │   Hub     │
+└─────┬─────┘  └─────┬─────┘  └─────┬─────┘
+      └───────────────┼──────────────┘
+                      ▼
+            Redis Pub/Sub
+       (cross-instance broadcast)
+```
+
+Rooms are in-memory per instance. When a user sends a message, the instance persists it (via Kafka → DB) and publishes to Redis Pub/Sub. All other instances receive the Pub/Sub message and broadcast to their local clients in that room.
+
+### Hub (In-Memory State Machine)
+
+The central `Hub` struct manages all real-time state using goroutine-safe channels:
+
+- **Register/Unregister** — client connection lifecycle
+- **JoinRoom/LeaveRoom** — room membership per connection
+- **Broadcast** — distribute messages within a room
+- **Manager** — periodic cleanup and room status updates
+- **UpdateUserPool** — periodic token validation against Gateway
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Runtime | Go 1.25 |
+| HTTP/WS Framework | Gin + Gorilla WebSocket |
+| Primary Database | MongoDB (via `mongo-go-driver`) |
+| Alternative Database | ScyllaDB / Cassandra (via `gocql`) |
+| Cache & Pub/Sub | Redis |
+| Message Queue (Messages) | Kafka (Sarama) |
+| Message Queue (Rooms) | RabbitMQ |
+| File Storage | MinIO (S3-compatible) |
+| Push Notifications | Ntfy.sh |
+| Auth | External Gateway Service (HTTP) |
+| ID Generation | ULID |
+| Container Runtime | Docker + Kubernetes |
+| Reverse Proxy | Nginx (with WS support) |
+
+---
+
+## Prerequisites
+
+- **Go 1.25+** (for local development)
+- **MongoDB** (or ScyllaDB)
 - **Redis**
-- **RabbitMQ**
-- یک **سرویس Gateway/Auth** که با درخواست `GET /api/user` و هدر `Authorization: <token>` اطلاعات کاربر را برگرداند.
+- **Kafka** (optional, for async message persistence)
+- **RabbitMQ** (optional, for external room creation)
+- **MinIO** (optional, for file uploads)
+- An external **Gateway/Auth Service** that exposes `GET /api/user` with `Authorization: <token>` header
 
 ---
 
-## متغیرهای محیطی
+## Environment Variables
 
-در روت پروژه فایل `.env` بسازید (یا از نمونه زیر استفاده کنید):
+Create a `.env` file in the project root:
 
 ```env
-# سرور چت
+# Server
 CHAT_WS_PORT=8080
+
+# Database Driver (mongo or scylla)
+DB_DRIVER=mongo
 
 # MongoDB
 MONGO_DB_HOST=localhost
 MONGO_DB_PORT=27017
-MONGO_DB_USERNAME=your_user
-MONGO_DB_PASSWORD=your_password
+MONGO_DB_USERNAME=user
+MONGO_DB_PASSWORD=password
 CHAT_DB=chat_db
 MAIN_DB=main_db
 
-# نام collectionها (اختیاری؛ در entity از env خوانده می‌شود)
-# MESSAGE_COLLECTION=messages
-# ROOM_COLLECTION=rooms
+# ScyllaDB (when DB_DRIVER=scylla)
+SCYLLA_HOSTS=localhost
+SCYLLA_PORT=9042
+SCYLLA_KEYSPACE=chat
 
-# سرویس احراز هویت (Gateway)
+# Redis
+REDIS_ADDR=localhost:6379
+REDIS_PASSWORD=
+
+# Gateway (Auth Service)
 GATEWAY_URL=http://localhost:8000
 
-# RabbitMQ
+# Kafka
+KAFKA_BROKERS=localhost:9092
+KAFKA_TOPIC=chat.messages
+
+# RabbitMQ (for external room creation)
 RABBITMQ_USER=guest
 RABBITMQ_PASSWORD=guest
 RABBITMQ_HOST=localhost
 RABBITMQ_QUEUE=chat.rooms
 
-# لیست ادمین‌های پشتیبانی برای چت پیش‌فرض
-# مثال: SUPPORT_ADMIN_IDS=10,11,12
-SUPPORT_ADMIN_IDS=
-```
+# MinIO (file storage)
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minio
+MINIO_SECRET_KEY=minio123
+MINIO_BUCKET=chat-files
 
-- **CHAT_WS_PORT**: پورتی که سرور چت روی آن بالا می‌آید.
-- **GATEWAY_URL**: آدرس پایه سرویس Gateway؛ سرویس چت برای اعتبارسنجی توکن به `GET {GATEWAY_URL}/api/user` با هدر `Authorization: <token>` درخواست می‌زند.
-- **RABBITMQ_QUEUE**: نام صفی که سرویس چت از آن پیام «اتاق جدید» را consume می‌کند.
+# Ntfy (push notifications)
+NTFY_TOPIC=chat-notifications
+NTFY_URL=https://ntfy.sh
+
+# Support chat (comma-separated admin user IDs)
+SUPPORT_ADMIN_IDS=10,11,12
+
+# Mock users (development only)
+MOCK_USERS_ENABLED=1
+```
 
 ---
 
-## اجرا
+## Getting Started
 
-### اجرای محلی
+### Local Development
 
 ```bash
-# وابستگی‌ها
 go mod download
-
-# اجرا (فرض: .env در پوشه بالاتر یا همین پوشه)
 go run ./cmd/main.go
 ```
 
-سرور روی `http://0.0.0.0:CHAT_WS_PORT` (مثلاً 8080) بالا می‌آید.
+Server starts on `http://0.0.0.0:CHAT_WS_PORT` (default 8080).
 
-### اجرا با Docker
+### Docker Compose
 
 ```bash
 docker-compose up --build
 ```
 
-سرویس چت روی پورت **8080** در دسترس است. MongoDB، Redis و RabbitMQ از داخل همان `docker-compose` استفاده می‌شوند.
+Spins up: 3 chat server replicas, MongoDB, Redis, Kafka, RabbitMQ, MinIO, Nginx (WS load balancer).
 
 ---
 
-## API و WebSocket
+## API Reference
 
-پایه آدرس: `http://localhost:8080` (یا همان `CHAT_WS_PORT`).
+### REST Endpoints
 
-### احراز هویت
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `POST` | `/chat/api/createRoom` | Create a new room | No |
+| `PUT` | `/chat/api/editRoom/:roomId` | Edit room properties | Token* |
+| `PUT` | `/chat/api/room/:roomId/avatar` | Update room avatar | Token* |
+| `GET` | `/chat/me` | Get current user info | Token |
+| `GET` | `/chat/mock-users` | List mock users (dev) | No |
+| `GET` | `/chat/room/pin/:roomId` | Toggle room pin | Token |
+| `GET` | `/chat/room/notification/:roomId` | Toggle room notification | Token |
+| `GET` | `/chat/user/last-seen/:userId` | Get user's last seen | Token |
+| `POST` | `/chat/files` | Upload a file | Token* |
+| `GET` | `/chat/files/:fileId` | Download/serve file | Token* |
 
-- در بیشتر endpointها **توکن** از طریق **query** ارسال می‌شود: `?token=<JWT یا توکن شما>`.
-- برای `GetRooms` توکن اجباری است و باید حداقل سه بخش (مثل JWT) داشته باشد.
-- سرویس چت خودش JWT را verify نمی‌کند؛ فقط وجود و فرمت را چک می‌کند. اعتبار واقعی با فراخوانی **Gateway** (`GET {GATEWAY_URL}/api/user`) انجام می‌شود.
+> `Token*` = token passed as query param `?token=...` or `Authorization` header.
+
+### Admin Endpoints
+
+Prefix: `/chat/api/admin`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/message/` | List messages (paginated, filterable) |
+| `GET` | `/message/:messageId` | Get single message |
+| `GET` | `/room/` | List rooms (paginated, filterable) |
+| `GET` | `/room/:roomId` | Get single room details |
+| `PUT` | `/room/:roomId/deactive` | Deactivate a room |
+| `PUT` | `/room/:roomId/active` | Activate a room |
+
+### WebSocket Endpoints
+
+| Path | Description |
+|------|-------------|
+| `GET /chat/ws` | **Unified WebSocket** — single connection for all rooms + user notifications (recommended) |
+| `GET /chat/ws/joinRoom/:roomId` | Legacy: connect to a specific room (one WS per room) |
+| `GET /chat/ws/seenMessage/:roomId` | Legacy: mark messages as read |
+| `GET /chat/ws/getRooms/` | Legacy: user room list + notification stream |
+| `GET /chat/ws/syncRooms/` | Legacy: sync additional connections |
+| `GET /chat/ws/getClients/:roomId` | Get online clients in a room |
 
 ---
 
-### REST
+## WebSocket Protocol
 
-| متد | مسیر | توضیح |
-|-----|------|--------|
-| `POST` | `/chat/ws/createRoom` | ساخت اتاق چت (بدون توکن) |
-| `GET` | `/chat/ws/getRooms/` | لیست اتاق‌های کاربر؛ **نیاز به توکن** دارد (همراه با اتاق پیش‌فرض پشتیبانی) |
-| `GET` | `/chat/ws/getClients/:roomId` | لیست کلاینت‌های آنلاین اتاق |
-| `GET` | `/chat/room/pin/:roomId` | پین کردن اتاق؛ هدر `Authorization` |
-| `GET` | `/chat/room/notification/:roomId` | تنظیم اعلان اتاق؛ هدر `Authorization` |
+### Unified WebSocket (`/chat/ws`)
 
-**ساخت اتاق (CreateRoom):**
+This is the **recommended** endpoint. A single connection handles rooms, messages, and user-level notifications.
+
+#### Connection
+
+```
+ws://localhost:8080/chat/ws?token=<TOKEN>
+```
+
+#### Server → Client Events
+
+| `event_type` | Payload | Description |
+|---|---|---|
+| `init` | `{ rooms: Room[], userId: string }` | Initial room list on connect |
+| `roomHistory` | `{ roomId, messages[] }` | Paginated message history |
+| `roomMessage` | `{ message }` | New message in a joined room |
+| `deliverMessage` | `{ messageId, userIds[] }` | Delivery confirmation |
+| `incomeMessage` | `{ message, room }` | New message (user not in room) |
+| `roomStatus` | `{ roomId, status }` | Room online/offline change |
+| `createNewRoom` | `{ room }` | New room created (via MQ or API) |
+| `seenMessage` | `{ roomId, userId, messageId }` | Read receipt |
+| `error` | `{ message }` | Error notification |
+
+#### Client → Server Events
+
+| `event_type` | Payload | Description |
+|---|---|---|
+| `listRooms` | `{ item: "1" }` | Request fresh room list (page number) |
+| `seenMessage` | `{ roomId, messageId, userId }` | Mark message as read |
+| `joinRoom` | `{ roomId }` | Join a room's message stream |
+| `leaveRoom` | `{ roomId }` | Leave a room's message stream |
+| `sendMessage` | `{ roomId, content, ulid }` | Send a message |
+| `forwardMessage` | `{ roomId, messageId }` | Forward a message |
+| `roomHistory` | `{ roomId, page }` | Request paginated history |
+| `ping` | `{ ulid: "ping" }` | Keep-alive |
+
+### Legacy: Per-Room WebSocket (`/chat/ws/joinRoom/:roomId`)
+
+```
+ws://localhost:8080/chat/ws/joinRoom/<roomId>?token=<TOKEN>&page=1
+```
+
+1. Server validates membership and sends message history.
+2. Client sends messages as JSON:
+   ```json
+   { "ulid": "<unique-id>", "content": "message text" }
+   ```
+3. Server broadcasts enriched message to all clients in the room.
+4. `{ "ulid": "ping" }` serves as keep-alive.
+
+### Support Room (Auto-Created)
+
+On first WebSocket connection (`/chat/ws` or `/chat/ws/getRooms/`), the service checks for a room with ID `support-<userId>`. If it doesn't exist:
+
+- Creates a room with ID `support-<userId>`, name `"پشتیبانی"` (Support).
+- Members: the user (Owner/Writer roles) + configured `SUPPORT_ADMIN_IDS` (Writer roles).
+- Stored in MongoDB; returned in the room list.
+
+---
+
+## Integration Guide
+
+### 1) Auth Service (Gateway)
+
+Your Gateway must expose:
 
 ```http
-POST /chat/ws/createRoom
+GET {GATEWAY_URL}/api/user
+Authorization: <token>
+```
+
+**Success (200):**
+```json
+{
+  "id": "user-123",
+  "username": "john",
+  "firstname": "John",
+  "lastname": "Doe",
+  "avatar": "https://..."
+}
+```
+
+**Non-200:** The chat service treats the token as invalid.
+
+### 2) Creating Rooms
+
+#### Option A: HTTP API (direct)
+
+```http
+POST /chat/api/createRoom
 Content-Type: application/json
 
 {
-  "Id": "room-uuid-or-slug",
-  "Name": "نام اتاق",
+  "Id": "room-uuid",
+  "Name": "Room Name",
+  "Type": "GROUP",
   "Member": [
     {
-      "Id": "user-id-1",
+      "Id": "user-1",
       "Roles": ["Owner", "Writer"],
-      "FirstName": "نام",
-      "LastName": "نام خانوادگی",
+      "FirstName": "John",
+      "LastName": "Doe",
       "AvatarUrl": "https://...",
       "Notification": true,
       "Pin": false
     }
-  ],
-  "Owner": ["user-id-1"],
-  "Writer": ["user-id-1"]
+  ]
 }
 ```
 
----
+#### Option B: RabbitMQ (decoupled)
 
-### WebSocket Endpoints
-
-همه این آدرس‌ها با **Upgrade به WebSocket** باز می‌شوند (مثلاً از مرورگر یا کلاینت WS).
-
-| مسیر | Query | توضیح |
-|------|--------|--------|
-| `GET /chat/ws/joinRoom/:roomId` | `token`, `page` | ورود به اتاق و دریافت پیام‌ها |
-| `GET /chat/ws/getRooms/` | `token` | لیست اتاق‌ها + اتصال به Hub برای نوتیفیکیشن (در صورت نبود، اتاق پشتیبانی را برای کاربر می‌سازد) |
-| `GET /chat/ws/syncRooms/` | `token` | سینک وضعیت اتاق‌ها برای کاربر آنلاین |
-| `GET /chat/ws/seenMessage/:roomId` | - | اعلام «خوانده‌شدن» پیام (نیاز به userId در context) |
-
-**نکته:** برای `seenMessage` باید قبلاً کاربر با همان `userId` به اتاق join کرده باشد (از طریق `joinRoom`).
-
----
-
-### جریان کلاینت (اتصال به اتاق و ارسال پیام)
-
-1. **دریافت لیست اتاق‌ها (WebSocket)**  
-   اتصال به:
-   ```text
-   ws://localhost:8080/chat/ws/getRooms/?token=<TOKEN>
-   ```
-   - اولین پیام از سرور: آرایه‌ای از اتاق‌ها (یا آرایه خالی).
-   - بعد از آن همین اتصال برای نوتیفیکیشن (اتاق جدید، وضعیت آنلاین/آفلاین، پیام جدید و …) استفاده می‌شود.
-
-2. **ورود به یک اتاق (WebSocket)**  
-   اتصال به:
-   ```text
-   ws://localhost:8080/chat/ws/joinRoom/<roomId>?token=<TOKEN>&page=1
-   ```
-   - سرور ابتدا دسترسی کاربر را (بر اساس `Member` و نقش‌های Owner/Writer) چک می‌کند.
-   - سپس لیست پیام‌های اتاق را (مثلاً ۱۰ تای آخر) روی همان WebSocket می‌فرستد.
-   - از این به بعد این اتصال برای **ارسال و دریافت پیام همان اتاق** استفاده می‌شود.
-
-3. **فرمت ارسال پیام از کلاینت به سرور (در همان WS اتاق)**  
-   هر پیام به صورت JSON:
-   ```json
-   {
-     "ulid": "یک شناسه یکتا (مثلاً ULID)",
-     "content": "متن پیام"
-   }
-   ```
-   - مقدار `"ulid": "ping"` برای نگه‌داشتن اتصال استفاده می‌شود.
-   - سرور همان پیام را با فیلدهای تکمیل‌شده (مثل `_id`, `RoomID`, `ClientID`, `CreatedAt`) به بقیه اعضای اتاق broadcast می‌کند.
-
-4. **فرمت پیام‌های دریافتی از سرور (در WS اتاق)**  
-   - **پیام چت:** آبجکت با فیلدهایی مثل `_id`, `Content`, `RoomID`, `ClientID`, `Username`, `Deliver`, `Read`, `CreatedAt`.
-   - **تأیید تحویل:** آبجکت با `event_type: "deliverMessage"` و محتوای مربوط به همان پیام.
-
-5. **اتصال لیست اتاق‌ها (GetRooms WS)**  
-   روی همین اتصال، سرور رویدادهایی با `event_type` می‌فرستد، از جمله:
-   - `roomStatus`: تغییر وضعیت آنلاین/آفلاین اتاق
-   - `incomeMessage`: پیام جدید در اتاقی که کاربر در آن باز نیست
-   - `listRooms`: به‌روزرسانی لیست اتاق‌ها
-   - `seenMessage`: خوانده‌شدن یک پیام
-   - `createNewRoom`: ساخت اتاق جدید
-
-   برای درخواست لیست به‌روز اتاق‌ها، کلاینت می‌تواند پیام زیر را روی همین WS بفرستد:
-   ```json
-   {
-     "event_type": "listRooms",
-     "item": "1"
-   }
-   ```
-   (`item` همان شماره صفحه است.)
-
-#### اتاق پیش‌فرض پشتیبانی برای هر کاربر
-
-- به محض این‌که کلاینت روی WS زیر وصل شود:
-
-  ```text
-  ws://localhost:8080/chat/ws/getRooms/?token=<TOKEN>
-  ```
-
-  سرویس چک می‌کند که آیا برای این کاربر اتاقی با الگوی `support-<userId>` وجود دارد یا نه.
-
-- اگر **وجود نداشته باشد**:
-  - یک اتاق جدید با `Id = "support-<userId>"` و `Name = "پشتیبانی"` ساخته می‌شود.
-  - اعضای اتاق:
-    - خود کاربر با نقش‌های `["Owner", "Writer"]`
-    - لیست ادمین‌های پشتیبانی که در `SUPPORT_ADMIN_IDS` (به صورت جداشده با کاما) تنظیم کرده‌اید، هر کدام با نقش `["Writer"]`.
-  - این اتاق در MongoDB ذخیره و در خروجی `getRooms` به کلاینت برگردانده می‌شود.
-
-- در سمت فرانت‌اند کافی است:
-  - بعد از دریافت لیست اتاق‌ها، اتاقی با `Id` شروع‌شونده با `support-` را تشخیص دهید و آن را به عنوان **چت با پشتیبان** نمایش دهید.
-  - join برای این اتاق مثل بقیه اتاق‌هاست:
-
-    ```text
-    ws://localhost:8080/chat/ws/joinRoom/support-<userId>?token=<TOKEN>&page=1
-    ```
-
-  - از نظر فرمت پیام و رویدادها هیچ تفاوتی با سایر اتاق‌ها ندارد؛ فقط نام/نوع و الگوی ID برای UI مهم است.
-
----
-
-### API ادمین
-
-پیشوند: `/chat/api/admin`.
-
-| متد | مسیر | توضیح |
-|-----|------|--------|
-| `GET` | `/chat/api/admin/room/` | لیست اتاق‌ها (با query مثل `userId`) |
-| `GET` | `/chat/api/admin/room/:roomId` | جزئیات یک اتاق |
-| `GET` | `/chat/api/admin/message/` | پیام‌ها (با query مثل `id`) |
-| `GET` | `/chat/api/admin/message/:messageId` | جزئیات یک پیام |
-
-این endpointها برای پنل ادمین یا ابزارهای داخلی هستند و در این سند جزئیات body/response آن‌ها توضیح داده نشده است.
-
----
-
-## یکپارچه‌سازی با سیستم شما
-
-### ۱) سرویس احراز هویت (Gateway)
-
-سرویس چت برای هر درخواستی که به توکن نیاز دارد، در صورت نبودن کاربر در کش داخلی، این درخواست را می‌زند:
-
-```http
-GET {GATEWAY_URL}/api/user
-Authorization: <توکن دریافتی از کلاینت>
-```
-
-- در صورت **200**: بدنه پاسخ باید شامل اطلاعات کاربر باشد (مثلاً `id`, `username`, `firstname`, `lastname`, `avatar`). این مقادیر در سرویس چت برای نمایش و سینک استفاده می‌شوند.
-- در صورت **غیر 200**: سرویس چت آن توکن را نامعتبر در نظر می‌گیرد و درخواست را رد می‌کند.
-
-بنابراین کافی است در سیستم خودتان:
-- یک endpoint مثل `GET /api/user` داشته باشید که با همان توکنی که به چت می‌دهید، کاربر را برگرداند.
-- در `docker-compose` یا `.env` مقدار `GATEWAY_URL` را به آدرس همین سرویس (مثلاً در شبکه Docker) تنظیم کنید.
-
-### ۲) ساخت اتاق از سیستم شما (بدون تماس مستقیم به چت)
-
-اگر ترجیح می‌دهید اتاق‌ها فقط از سرویس خودتان ساخته شوند، می‌توانید به جای `POST /chat/ws/createRoom` از **RabbitMQ** استفاده کنید.
-
-- **صف:** همان صفی که در `RABBITMQ_QUEUE` تنظیم کرده‌اید (مثلاً `chat.rooms`).
-- **فرمت پیام (JSON):**
+Publish to the configured `RABBITMQ_QUEUE`:
 
 ```json
 {
-  "Id": "room-unique-id",
-  "Name": "نام اتاق",
+  "Id": "room-uuid",
+  "Name": "Room Name",
   "type": "GROUP",
   "Member": [
     {
-      "Id": "user-id-1",
+      "Id": "user-1",
       "roles": ["Owner", "Writer"],
-      "firstname": "نام",
-      "lastname": "نام خانوادگی",
+      "firstname": "John",
+      "lastname": "Doe",
       "AvatarUrl": "https://...",
       "Notification": false,
       "Pin": false
@@ -313,54 +412,133 @@ Authorization: <توکن دریافتی از کلاینت>
 }
 ```
 
-- **نوع اتاق (`type`):** مقادیر مجاز در کد: `PRIVATE`, `GROUP`, `TEMP`.
-- وقتی این پیام را در صف publish کنید، سرویس چت آن را consume می‌کند و در صورت نبود اتاق با همین `Id`، اتاق را در MongoDB می‌سازد و به کاربران آنلاین مربوطه نوتیفیکیشن `createNewRoom` می‌فرستد.
+Room types: `PRIVATE`, `GROUP`, `TEMP`, `SUPPORT`, `CHANEL`, `BOT`.
 
-در سیستم خودتان:
-- بعد از ساخت اتاق در دیتابیس/منطق خودتان، یک بار همین JSON را به صف RabbitMQ بفرستید تا چت با آن سینک شود.
+### 3) File Uploads
 
-### ۳) فراخوانی مستقیم CreateRoom از بک‌اند
+```http
+POST /chat/files
+Content-Type: multipart/form-data
+?token=<TOKEN>
 
-اگر ترجیح می‌دهید اتاق مستقیماً در چت ساخته شود، از سرویس خودتان به صورت HTTP به `POST /chat/ws/createRoom` درخواست بزنید و body را مطابق جدول بالا بفرستید. در این حالت نیازی به RabbitMQ برای همان اتاق نیست.
+file: <binary>
+```
 
-### ۴) کلاینت (وب/موبایل)
+Returns `204` with `Location` header containing the file ID.
 
-- برای هر کاربر یک **توکن** (مثلاً JWT) از Gateway خودتان صادر کنید.
-- در اپ یا وب، به آدرس پایه چت (مثلاً `https://chat.yourdomain.com`) وصل شوید و در همه درخواست‌ها و اتصال WebSocket همان توکن را در query یا هدر بفرستید.
-- جریان توصیه‌شده:
-  1. اتصال به `getRooms/?token=...` و نگه‌داشتن این اتصال برای نوتیفیکیشن.
-  2. برای هر اتاقی که کاربر باز می‌کند: اتصال به `joinRoom/<roomId>?token=...&page=1` و ارسال/دریافت پیام با فرمت بالا.
-  3. برای اعلام «خوانده‌شدن» از endpoint مربوط به `seenMessage` استفاده کنید (با توجه به اینکه `userId` در context ست شده باشد).
+### 4) Client Integration (Recommended Flow)
 
----
-
-## Docker
-
-- **Build:**
-  ```bash
-  docker build -t chat-service .
-  ```
-
-- **Run با docker-compose (همه سرویس‌ها):**
-  ```bash
-  docker-compose up --build
-  ```
-
-- در `docker-compose` سرویس **chat** به `chat-mongo`, `chat-redis` و `rabbitmq` وابسته است. برای اتصال به Gateway خودتان، متغیر **GATEWAY_URL** را در بخش `environment` سرویس `chat` به آدرس سرویس Gateway (مثلاً در همان شبکه Docker) تنظیم کنید.
-
-- پورت‌ها:
-  - چت: **8080**
-  - MongoDB: **27017**
-  - Redis: **6379**
-  - RabbitMQ: **5672** (AMQP), **15672** (Management UI)
+1. Obtain a **token** from your Gateway.
+2. Connect to `ws://<chat-host>/chat/ws?token=<TOKEN>` (Unified WS).
+3. Listen for `init` event → get room list.
+4. To open a room, send `{ "event_type": "joinRoom", "roomId": "..." }`.
+5. Send messages: `{ "event_type": "sendMessage", "roomId": "...", "content": "...", "ulid": "..." }`.
+6. Mark as read: `{ "event_type": "seenMessage", "roomId": "...", "messageId": "...", "userId": "..." }`.
 
 ---
 
-## جمع‌بندی
+## Deployment
 
-- **اجرا:** `go run ./cmd/main.go` یا `docker-compose up --build`.
-- **احراز هویت:** توکن را از Gateway خودتان بگیرید و در هر درخواست/WebSocket به چت بفرستید؛ چت با `GET {GATEWAY_URL}/api/user` اعتبار را چک می‌کند.
-- **اتاق:** یا با `POST /chat/ws/createRoom` یا با publish کردن JSON اتاق به صف `RABBITMQ_QUEUE`.
-- **چت real-time:** WebSocket به `joinRoom/<roomId>?token=...` و ارسال پیام با `{ "ulid": "...", "content": "..." }`.
+### Docker
 
-اگر خواستید برای یک پلتفرم خاص (مثلاً فقط وب یا فقط اندروید) نمونه کد کلاینت هم اضافه شود، می‌توان آن را به این README یا یک فایل جدا (مثلاً `INTEGRATION.md`) اضافه کرد.
+```bash
+docker build -t chat-service .
+docker-compose up --build
+```
+
+The `docker-compose.yml` includes:
+- 3 chat server replicas (for scaling)
+- MongoDB, Redis, Kafka, RabbitMQ, MinIO
+- Nginx reverse proxy with WebSocket support and least-connections load balancing
+
+### Kubernetes
+
+Manifests in `k8s/`:
+
+```bash
+kubectl apply -f k8s/chat-shanakht.yaml
+kubectl apply -f k8s/mongo.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/scylla.yaml          # optional
+```
+
+Features:
+- 2 replicas with session affinity
+- ConfigMap from `k8s/env.dev` or `k8s/env.prod`
+- NodePort service
+- StatefulSets for MongoDB, Redis, ScyllaDB
+
+### CI/CD (GitLab)
+
+Configured in `.gitlab-ci.yml`:
+- Build and push Docker image on `main`/`develop` branches to `registry.meetpeet.ir`
+- Deploy to k3s via kubectl (create ConfigMap, apply manifests, update image, rollout)
+
+### Nginx Configuration
+
+The `nginx/` directory provides a reverse proxy config with:
+- WebSocket `Upgrade` header support
+- Least-connections load balancing across 3 upstream servers
+- 24-hour proxy timeout for long-lived WS connections
+
+---
+
+## Project Structure
+
+```
+cmd/
+├── main.go              # Entry point (MongoDB, Redis, Kafka, Hub init)
+├── scylla.go            # ScyllaDB initialization
+
+internal/
+├── ws/                  # Core WebSocket engine
+│   ├── hub.go           # Hub: in-memory state machine (rooms, users, clients)
+│   ├── client.go        # WebSocket client, message types, ConnsWriter
+│   ├── user.go          # User model + WireRooms (room-to-user routing)
+│   ├── ws_handler.go    # Gin handlers for WS upgrade + REST endpoints
+│   ├── database.go      # DatabaseProvider interface
+│   ├── database_mongo.go    # MongoDB adapter
+│   ├── database_scylla.go   # ScyllaDB adapter
+│   ├── message_service.go   # Message persistence + Redis cache
+│   ├── room_service.go      # Room operations (sync, pin, notifications)
+│   ├── redis_pubsub.go      # Cross-instance Pub/Sub
+│   ├── redis_presence.go    # Online/offline tracking
+│   ├── rabbitbroker.go      # RabbitMQ consumer for room creation
+│   ├── minio_storage.go     # MinIO S3 file storage
+│   ├── file_handler.go      # File upload/download
+│   ├── ntfy_service.go      # Push notifications
+│   ├── permissions.go       # Role-based access control
+│   └── helpers.go           # ULID generation, type converters
+├── core/                    # Clean architecture (newer)
+│   ├── domain/              # Domain entities
+│   ├── ports/               # Service + repository interfaces
+│   └── services/            # ChatService implementation
+├── adapters/repository/     # Adapter implementations
+│   ├── mongo/               # MongoDB repo (room, message, user)
+│   └── scylla/              # ScyllaDB repo
+├── admin/admin_handler.go   # Admin REST API handler
+└── message_broker/          # Kafka producer + consumer
+
+router/router.go          # All Gin route definitions
+
+entity/                   # Legacy entity layer
+ports/                    # Legacy port interfaces
+adapters/                 # Legacy adapter implementations
+Dtos/                     # Data transfer objects
+enums/                    # Status enums (online/offline, room status)
+helper/                   # API response wrapper
+transform/                # Entity-to-DTO transformers
+util/                     # Password hashing utilities
+config/                   # Mock users JSON
+```
+
+---
+
+## Project Status
+
+This project has **two coexisting architectural layers**:
+
+1. **Legacy** (`entity/`, `ports/`, `adapters/`, `internal/ws/`) — the original implementation, actively used.
+2. **Newer clean architecture** (`internal/core/`, `internal/adapters/repository/`) — a refactoring effort with cleaner separation.
+
+Both coexist; the legacy layer powers the main WebSocket engine while the newer layer is progressively being adopted.
