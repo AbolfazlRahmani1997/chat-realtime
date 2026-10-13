@@ -1,4 +1,21 @@
 services:
+  chat-scylla:
+    image: scylladb/scylla:5.4
+    restart: unless-stopped
+    command: ["--smp", "1", "--memory", "1G", "--overprovisioned", "1", "--developer-mode", "1"]
+    ports:
+      - "9042:9042"
+    volumes:
+      - scylla_data:/var/lib/scylla
+    networks:
+      - chat
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
   chat-kafka:
     image: bitnami/kafka:3.9
     restart: always
@@ -157,3 +174,7 @@ services:
 networks:
   chat:
     driver: bridge
+
+volumes:
+  kafka_data:
+  scylla_data:

@@ -93,9 +93,7 @@ func (receiver Handler) DeactiveRoom(c *gin.Context) {
 	}
 	receiver.roomService.EditRooms(dto)
 
-	if cached, ok := receiver.hub.Rooms[c.Param("roomId")]; ok {
-		cached.ActiveStatus = string(enums.Deactive)
-	}
+	receiver.hub.SetCachedRoomActiveStatus(c.Param("roomId"), string(enums.Deactive))
 
 	c.JSON(200, gin.H{"message": "room deactivated"})
 }
@@ -109,9 +107,7 @@ func (receiver Handler) ActiveRoom(c *gin.Context) {
 	}
 	receiver.roomService.EditRooms(dto)
 
-	if cached, ok := receiver.hub.Rooms[c.Param("roomId")]; ok {
-		cached.ActiveStatus = string(enums.Active)
-	}
+	receiver.hub.SetCachedRoomActiveStatus(c.Param("roomId"), string(enums.Active))
 
 	c.JSON(200, gin.H{"message": "room activated"})
 }

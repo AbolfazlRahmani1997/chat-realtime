@@ -38,7 +38,8 @@ type PubSubRoomEvent struct {
 
 type PubSubReadReceipt struct {
 	MessageID string `json:"message_id"`
-	UserID    string `json:"user_id"`
+	UserID    string `json:"user_id"`             // reader
+	AuthorID  string `json:"author_id,omitempty"` // message author to notify
 	RoomID    string `json:"room_id"`
 }
 
@@ -158,8 +159,11 @@ func (b *RedisPubSubBroker) handleIncomingMessage(pubMsg *PubSubMessage) {
 		Read:        m.Read,
 		ReplyTo:     m.ReplyTo,
 		ForwardFrom: m.ForwardFrom,
+		remote:      true,
+		CreatedAt:   m.CreatedAt,
+		UpdatedAt:   m.UpdatedAt,
 	}
-	b.hub.Broadcast <- msg
+	b.hub.EnqueueBroadcast(msg)
 }
 
 func (b *RedisPubSubBroker) handleIncomingRoomEvent(event *PubSubRoomEvent) {
@@ -169,43 +173,17 @@ func (b *RedisPubSubBroker) handleIncomingRoomEvent(event *PubSubRoomEvent) {
 	switch event.Type {
 	case "room_created":
 		if event.RoomData != nil {
-			b.hub.mx.Lock()
-			if _, exists := b.hub.Rooms[event.RoomData.ID]; !exists {
-				room := &Room{
-					ID:      event.RoomData.ID,
-					Name:    event.RoomData.Name,
-					Type:    event.RoomData.Type,
-					Members: event.RoomData.Members,
-					Status:  event.RoomData.Status,
-					Clients: make(map[string]*Client),
-				}
-				b.hub.Rooms[event.RoomData.ID] = room
-			}
-			b.hub.mx.Unlock()
+			b.hub.EnsureRoom(*event.RoomData)
 		}
 
 	case "user_online":
-		b.hub.mx.RLock()
-		user, exists := b.hub.Users[event.UserID]
-		b.hub.mx.RUnlock()
-
-		if exists && user != nil {
-			select {
-			case user.roomStatuses <- &RoomStatus{RoomId: event.RoomID, Status: online}:
-			default:
-			}
+		if user, ok := b.hub.getUserLocked(event.UserID); ok && user != nil {
+			user.trySendRoomStatus(&RoomStatus{RoomId: event.RoomID, Status: online})
 		}
 
 	case "user_offline":
-		b.hub.mx.RLock()
-		user, exists := b.hub.Users[event.UserID]
-		b.hub.mx.RUnlock()
-
-		if exists && user != nil {
-			select {
-			case user.roomStatuses <- &RoomStatus{RoomId: event.RoomID, Status: offline}:
-			default:
-			}
+		if user, ok := b.hub.getUserLocked(event.UserID); ok && user != nil {
+			user.trySendRoomStatus(&RoomStatus{RoomId: event.RoomID, Status: offline})
 		}
 	}
 }
@@ -214,14 +192,12 @@ func (b *RedisPubSubBroker) handleIncomingReadReceipt(receipt *PubSubReadReceipt
 	if b.hub == nil {
 		return
 	}
-	b.hub.mx.RLock()
-	user, exists := b.hub.Users[receipt.UserID]
-	b.hub.mx.RUnlock()
-
-	if exists && user != nil {
-		select {
-		case user.seenMessage <- &SeenNotification{MessageId: receipt.MessageID, RoomId: receipt.RoomID}:
-		default:
-		}
+	// Notify the author on this instance; fall back only if AuthorID missing (legacy payloads).
+	targetID := receipt.AuthorID
+	if targetID == "" || targetID == receipt.UserID {
+		return
+	}
+	if user, ok := b.hub.getUserLocked(targetID); ok && user != nil {
+		user.trySendSeen(&SeenNotification{MessageId: receipt.MessageID, RoomId: receipt.RoomID})
 	}
 }

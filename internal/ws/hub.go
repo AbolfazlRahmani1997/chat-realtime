@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"server/internal/message_broker"
@@ -92,6 +93,12 @@ type AddConnectionRequest struct {
 	Conn         ConnWriter
 }
 
+const (
+	hubBroadcastBuffer  = 4096
+	hubBroadcastWorkers = 32
+	hubControlBuffer    = 256
+)
+
 type Hub struct {
 	mx                   sync.RWMutex
 	Users                map[string]*User
@@ -114,6 +121,7 @@ type Hub struct {
 	DB                   DatabaseProvider
 	Ntfy                 *NtfyService
 	KafkaProducer        *messagebroker.Producer
+	droppedBroadcasts    atomic.Uint64
 }
 
 func NewHub(client *mongo.Client, redisClient *redis.Client, db DatabaseProvider, kafkaProducer *messagebroker.Producer) *Hub {
@@ -133,19 +141,19 @@ func NewHub(client *mongo.Client, redisClient *redis.Client, db DatabaseProvider
 	}
 	RoomService = NewRoomService(RoomRepository, messageRepository, userRepository, db)
 	service = MessageService{messageRepository, db}
-	roomChan := make(chan *Room)
+	roomChan := make(chan *Room, hubControlBuffer)
 
 	hub := &Hub{
 		Rooms:                make(map[string]*Room),
-		Register:             make(chan *Client),
-		ReadAble:             make(chan *ReadMessage),
-		Unregister:           make(chan *Client),
-		Broadcast:            make(chan *Message, 100),
-		Join:                 make(chan *User),
-		AddConnection:        make(chan *AddConnectionRequest),
-		AddUnifiedConnection: make(chan *AddConnectionRequest),
-		Left:                 make(chan *UserConnection),
-		Evade:                make(chan *User),
+		Register:             make(chan *Client, hubControlBuffer),
+		ReadAble:             make(chan *ReadMessage, hubControlBuffer),
+		Unregister:           make(chan *Client, hubControlBuffer),
+		Broadcast:            make(chan *Message, hubBroadcastBuffer),
+		Join:                 make(chan *User, hubControlBuffer),
+		AddConnection:        make(chan *AddConnectionRequest, hubControlBuffer),
+		AddUnifiedConnection: make(chan *AddConnectionRequest, hubControlBuffer),
+		Left:                 make(chan *UserConnection, hubControlBuffer),
+		Evade:                make(chan *User, hubControlBuffer),
 		Users:                make(map[string]*User),
 		Room:                 roomChan,
 		MessageService:       service,
@@ -187,261 +195,414 @@ func NewHub(client *mongo.Client, redisClient *redis.Client, db DatabaseProvider
 }
 
 func (h *Hub) Run() {
-	defer func() {
-	}()
-
+	for i := 0; i < hubBroadcastWorkers; i++ {
+		go h.broadcastWorker()
+	}
 	for {
 		select {
 		case messageId := <-h.ReadAble:
-			go func() {
-				message := h.MessageService.MessageRead(messageId.MessageId, messageId.UserId)
-				h.mx.RLock()
-				user, ok := h.Users[message.ClientID]
-				h.mx.RUnlock()
-				if ok && user != nil {
-					select {
-					case user.seenMessage <- &SeenNotification{MessageId: message.UniqId, RoomId: message.RoomID}:
-					default:
-					}
-				}
-				if h.RedisBroker != nil && message.RoomID != "" {
-					h.RedisBroker.PublishReadReceipt(&PubSubReadReceipt{
-						MessageID: messageId.MessageId,
-						UserID:    messageId.UserId,
-						RoomID:    message.RoomID,
-					})
-				}
-			}()
+			go h.handleReadReceipt(messageId)
 		case room := <-h.Room:
-			{
-				h.Rooms[room.ID] = &Room{
-					_Id:     room._Id,
-					ID:      room.ID,
-					Name:    room.Name,
-					Members: room.Members,
-					Clients: make(map[string]*Client),
-				}
-				if room._Id.IsZero() {
-					SyncedRoom := h.RoomService.SyncUser(*room)
-					for _, member := range room.Members {
-						if user, ok := h.Users[member.Id]; ok {
-
-							if user.IsConnected {
-								go func() {
-									user.createRoom <- &SyncedRoom
-								}()
-							}
-						}
-					}
-				}
-
-				if h.RedisBroker != nil {
-					h.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
-						Type:     "room_created",
-						RoomID:   room.ID,
-						RoomData: h.Rooms[room.ID],
-					})
-				}
-
-				if h.Ntfy != nil && room._Id.IsZero() {
-					for _, member := range room.Members {
-						if member.Id != "" {
-							go h.Ntfy.NotifyNewRoom(member.Id, room.Name)
-						}
-					}
-				}
-
-			}
-
+			h.handleRoomCreated(room)
 		case cl := <-h.Register:
-			if _, ok := h.Rooms[cl.RoomID]; ok {
-				r := h.Rooms[cl.RoomID]
-				if client, ok := r.Clients[cl.ID]; ok {
-					cl.Conn = mergeConnection(cl.Conn, client.Conn)
-					cl.Message = make(chan *Message)
-					cl.Status = online
-
-				} else {
-					r.Clients[cl.ID] = cl
-				}
-				if !cl.UnifiedConn {
-					for s := range cl.Conn {
-						go cl.readerMessage(s, h)
-					}
-				}
-				r.Clients[cl.ID] = cl
-				room := h.Rooms[cl.RoomID]
-				room.Status = online
-				go func() {
-					members := h.Rooms[cl.RoomID].Members
-					for _, member := range members {
-						if user, ok := h.Users[member.Id]; ok {
-							if cl.ID != user.UserId {
-								go func() {
-									user.roomStatuses <- &RoomStatus{
-										RoomId: h.Rooms[cl.RoomID].ID,
-										Status: online,
-									}
-								}()
-							}
-
-						}
-					}
-
-				}()
-
-			}
+			h.handleRegister(cl)
 		case cl := <-h.Unregister:
-			if room, ok := h.Rooms[cl.RoomID]; ok {
-				if _, ok := room.Clients[cl.ID]; ok {
-					close(cl.Message)
-					delete(room.Clients, cl.ID)
-				}
-				members := room.Members
-				if len(room.Clients) == 0 {
-					room.Status = offline
-					h.RoomService.changeRoomStatus(*room)
-					delete(h.Rooms, cl.RoomID)
-				}
+			h.handleUnregister(cl)
+		}
+	}
+}
 
-				for _, member := range members {
-					if user, ok := h.Users[member.Id]; ok {
-						go func(u *User, roomId string) {
-							u.roomStatuses <- &RoomStatus{
-								RoomId: roomId,
-								Status: offline,
-							}
-						}(user, room.ID)
-					}
-				}
+func (h *Hub) broadcastWorker() {
+	for m := range h.Broadcast {
+		h.handleBroadcast(m)
+	}
+}
 
+// EnqueueBroadcast queues a message for fan-out without blocking callers forever.
+func (h *Hub) EnqueueBroadcast(m *Message) bool {
+	if m == nil {
+		return false
+	}
+	select {
+	case h.Broadcast <- m:
+		return true
+	default:
+		n := h.droppedBroadcasts.Add(1)
+		// Rate-limit logs under load (every 10k drops).
+		if n == 1 || n%10000 == 0 {
+			log.Printf("hub: broadcast queue full (dropped=%d) room=%s uniq=%s", n, m.RoomID, m.UniqId)
+		}
+		return false
+	}
+}
+
+func (h *Hub) handleReadReceipt(messageId *ReadMessage) {
+	if messageId == nil {
+		return
+	}
+	message := h.MessageService.MessageRead(messageId.MessageId, messageId.UserId)
+	if message.ID == "" && message.UniqId == "" {
+		return
+	}
+	roomID := message.RoomID
+	if roomID == "" {
+		roomID = messageId.RoomID
+	}
+	msgKey := message.UniqId
+	if msgKey == "" {
+		msgKey = message.ID
+	}
+	// Notify the message author (not the reader).
+	authorID := message.ClientID
+	if authorID != "" && authorID != messageId.UserId {
+		if user, ok := h.getUserLocked(authorID); ok && user != nil {
+			user.trySendSeen(&SeenNotification{MessageId: msgKey, RoomId: roomID})
+		}
+	}
+	if h.RedisBroker != nil && roomID != "" {
+		h.RedisBroker.PublishReadReceipt(&PubSubReadReceipt{
+			MessageID: msgKey,
+			UserID:    messageId.UserId,
+			AuthorID:  authorID,
+			RoomID:    roomID,
+		})
+	}
+}
+
+func (h *Hub) handleRoomCreated(room *Room) {
+	if room == nil || room.ID == "" {
+		return
+	}
+	h.mx.Lock()
+	cached := &Room{
+		_Id:       room._Id,
+		ID:        room.ID,
+		Name:      room.Name,
+		Type:      room.Type,
+		AvatarUrl: room.AvatarUrl,
+		Members:   append([]Member(nil), room.Members...),
+		Status:    room.Status,
+		Clients:   make(map[string]*Client),
+	}
+	if existing, ok := h.Rooms[room.ID]; ok && existing != nil {
+		// Keep live clients if room was EnsureRoom'd before notify path.
+		cached.Clients = existing.Clients
+		if cached.Status == "" {
+			cached.Status = existing.Status
+		}
+	}
+	h.Rooms[room.ID] = cached
+	members := append([]Member(nil), room.Members...)
+	roomID := room.ID
+	roomName := room.Name
+	isNew := room._Id.IsZero()
+	var candidateUsers []*User
+	if isNew {
+		for _, member := range members {
+			if user, ok := h.Users[member.Id]; ok && user != nil {
+				candidateUsers = append(candidateUsers, user)
 			}
-		case m := <-h.Broadcast:
+		}
+	}
+	roomData := *cached
+	roomData.Clients = nil
+	h.mx.Unlock()
 
-			go func() {
-				isRemote := m.ID != ""
-				m.CreatedAt = time.Now()
-				if _, ok := h.Rooms[m.RoomID]; ok {
-					if m.ID == "" {
-						m.Deliver = nil
-						m.Read = nil
-						m.ID = m.UniqId
+	// Check connection state outside h.mx to avoid lock-order issues with User.mx.
+	var notifyUsers []*User
+	for _, user := range candidateUsers {
+		if user.hasConnections() {
+			notifyUsers = append(notifyUsers, user)
+		}
+	}
 
-						if h.KafkaProducer != nil {
-							payload := &messagebroker.MessagePayload{
-								ID:          m.ID,
-								Content:     m.Content,
-								Type:        m.Type,
-								UniqId:      m.UniqId,
-								RoomID:      m.RoomID,
-								Username:    m.Username,
-								ClientID:    m.ClientID,
-								Deliver:     m.Deliver,
-								Read:        m.Read,
-								CreatedAt:   m.CreatedAt,
-								UpdatedAt:   m.UpdatedAt,
-							}
-							if m.ReplyTo != nil {
-								b, _ := json.Marshal(m.ReplyTo)
-								var ri messagebroker.ReplyInfo
-								json.Unmarshal(b, &ri)
-								payload.ReplyTo = &ri
-							}
-							if m.ForwardFrom != nil {
-								b, _ := json.Marshal(m.ForwardFrom)
-								var fi messagebroker.ForwardInfo
-								json.Unmarshal(b, &fi)
-								payload.ForwardFrom = &fi
-							}
-							if err := h.KafkaProducer.PublishMessage(payload); err != nil {
-								log.Printf("kafka publish failed, falling back to direct DB write: %v", err)
-								h.DB.MessageOps().InsertMessage(*m)
-							}
-						} else {
-							h.DB.MessageOps().InsertMessage(*m)
-						}
-					}
-					h.RoomService.UpdateLastMessage(*h.Rooms[m.RoomID], *m)
-
-					if h.RedisBroker != nil && !isRemote {
-						h.RedisBroker.PublishMessage(m.RoomID, m)
-					}
-
-					members := h.Rooms[m.RoomID].Members
-					var firstname string
-					var lastname string
-					for _, userID := range members {
-
-						if userID.Id == m.ClientID {
-
-							firstname = userID.FirstName
-							lastname = userID.LastName
-						}
-
-						if user, ok := h.Users[userID.Id]; ok {
-							if _, ok := h.Rooms[m.RoomID].Clients[user.UserId]; !ok {
-								if user.UserId != m.ClientID {
-
-									go func() {
-										user.pupMessage <- &PupMessage{
-											MessageId: m.ID,
-											RoomId:    m.RoomID,
-											Firstname: firstname,
-											Lastname:  lastname,
-											Content:   m.Content,
-											Type:      m.Type,
-										}
-									}()
-
-								}
-							}
-
-						}
-
-					}
-					if h.Ntfy != nil && m.ClientID != "" {
-						senderName := firstname
-						if lastname != "" {
-							senderName += " " + lastname
-						}
-						if senderName == "" || senderName == " " {
-							senderName = m.Username
-						}
-						if senderName == "" {
-							senderName = "کاربر"
-						}
-						roomClients := h.Rooms[m.RoomID].Clients
-						for _, userID := range members {
-							if userID.Id == m.ClientID {
-								continue
-							}
-							_, inRoom := roomClients[userID.Id]
-							if !inRoom {
-								go h.Ntfy.NotifyNewMessage(userID.Id, senderName, m.Content, m.RoomID, m.Type, "")
-							}
-						}
-					}
-					for _, cl := range h.Rooms[m.RoomID].Clients {
-
-						if ok := cl.Status == online; ok {
-							if cl.ID != m.ClientID {
-								m.Deliver = append(m.Deliver, cl.ID)
-								h.DB.MessageOps().MessageDelivery(m.ID, m.Deliver)
-							}
-							select {
-							case cl.Message <- m:
-							default:
-							}
-
-						}
-
-					}
-
+	// Heavy I/O must not block the Hub control loop.
+	go func() {
+		if isNew {
+			synced := h.RoomService.SyncUser(*room)
+			for _, user := range notifyUsers {
+				user.trySendCreateRoom(&synced)
+			}
+		}
+		if h.RedisBroker != nil {
+			h.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
+				Type:     "room_created",
+				RoomID:   roomID,
+				RoomData: &roomData,
+			})
+		}
+		if h.Ntfy != nil && isNew {
+			for _, member := range members {
+				if member.Id != "" {
+					go h.Ntfy.NotifyNewRoom(member.Id, roomName)
 				}
+			}
+		}
+	}()
+}
 
-			}()
+func (h *Hub) handleRegister(cl *Client) {
+	if cl == nil {
+		return
+	}
+	h.mx.Lock()
+	room, ok := h.Rooms[cl.RoomID]
+	if !ok || room == nil {
+		h.mx.Unlock()
+		cl.shutdown()
+		return
+	}
+	if existing, exists := room.Clients[cl.ID]; exists && existing != nil && existing != cl {
+		// Legacy multi-conn rooms may merge sockets; unified WS must not inherit stale conns.
+		if !cl.UnifiedConn {
+			existing.mu.Lock()
+			oldConns := mergeConnection(nil, existing.Conn)
+			existing.mu.Unlock()
+			cl.mu.Lock()
+			cl.Conn = mergeConnection(cl.Conn, oldConns)
+			cl.mu.Unlock()
+		}
+		existing.shutdown()
+	}
+	if cl.Message == nil {
+		cl.Message = newClientMessageChan()
+	}
+	cl.setStatus(online)
+	room.Clients[cl.ID] = cl
+	room.Status = online
+	members := append([]Member(nil), room.Members...)
+	roomID := room.ID
+	clientID := cl.ID
+	unified := cl.UnifiedConn
+	var connKeys []string
+	if !unified {
+		cl.mu.Lock()
+		for s := range cl.Conn {
+			connKeys = append(connKeys, s)
+		}
+		cl.mu.Unlock()
+	}
+	var notifyUsers []*User
+	for _, member := range members {
+		if user, ok := h.Users[member.Id]; ok && user != nil && clientID != user.UserId {
+			notifyUsers = append(notifyUsers, user)
+		}
+	}
+	h.mx.Unlock()
+
+	if !unified {
+		for _, s := range connKeys {
+			go cl.readerMessage(s, h)
+		}
+	}
+	for _, user := range notifyUsers {
+		user.trySendRoomStatus(&RoomStatus{RoomId: roomID, Status: online})
+	}
+}
+
+func (h *Hub) handleUnregister(cl *Client) {
+	if cl == nil {
+		return
+	}
+	h.mx.Lock()
+	room, ok := h.Rooms[cl.RoomID]
+	if !ok || room == nil {
+		h.mx.Unlock()
+		cl.shutdown()
+		return
+	}
+	existing, exists := room.Clients[cl.ID]
+	if !exists || existing != cl {
+		// Stale unregister after reconnect replaced this client.
+		h.mx.Unlock()
+		if existing != cl {
+			cl.shutdown()
+		}
+		return
+	}
+	delete(room.Clients, cl.ID)
+	members := append([]Member(nil), room.Members...)
+	roomID := room.ID
+	roomEmpty := len(room.Clients) == 0
+	var notifyUsers []*User
+	if roomEmpty {
+		room.Status = offline
+		// Drop local cache only. Do NOT persist offline — other instances may still have clients.
+		delete(h.Rooms, cl.RoomID)
+		for _, member := range members {
+			if user, ok := h.Users[member.Id]; ok && user != nil {
+				notifyUsers = append(notifyUsers, user)
+			}
+		}
+	}
+	h.mx.Unlock()
+
+	cl.shutdown()
+
+	// Only when this node has no clients left in the room.
+	for _, user := range notifyUsers {
+		user.trySendRoomStatus(&RoomStatus{RoomId: roomID, Status: offline})
+	}
+}
+
+func (h *Hub) handleBroadcast(m *Message) {
+	if m == nil {
+		return
+	}
+	isRemote := m.remote
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now()
+	}
+
+	snap, ok := h.snapshotRoomForBroadcast(m.RoomID)
+	if !ok {
+		// Cross-instance: room may not be cached here, but local Users still need incomeMessage.
+		if isRemote {
+			snap, ok = h.snapshotMembersFromDB(m.RoomID)
+		}
+		if !ok {
+			return
+		}
+	}
+
+	if !isRemote {
+		m.Deliver = nil
+		m.Read = nil
+		if m.ID == "" {
+			m.ID = m.UniqId
 		}
 
+		if h.KafkaProducer != nil {
+			payload := &messagebroker.MessagePayload{
+				ID:        m.ID,
+				Content:   m.Content,
+				Type:      m.Type,
+				UniqId:    m.UniqId,
+				RoomID:    m.RoomID,
+				Username:  m.Username,
+				ClientID:  m.ClientID,
+				Deliver:   m.Deliver,
+				Read:      m.Read,
+				CreatedAt: m.CreatedAt,
+				UpdatedAt: m.UpdatedAt,
+			}
+			if m.ReplyTo != nil {
+				b, _ := json.Marshal(m.ReplyTo)
+				var ri messagebroker.ReplyInfo
+				_ = json.Unmarshal(b, &ri)
+				payload.ReplyTo = &ri
+			}
+			if m.ForwardFrom != nil {
+				b, _ := json.Marshal(m.ForwardFrom)
+				var fi messagebroker.ForwardInfo
+				_ = json.Unmarshal(b, &fi)
+				payload.ForwardFrom = &fi
+			}
+			if err := h.KafkaProducer.PublishMessage(payload); err != nil {
+				log.Printf("kafka publish failed, falling back to direct DB write: %v", err)
+				if h.DB != nil {
+					h.DB.MessageOps().InsertMessage(*m)
+				}
+			}
+		} else if h.DB != nil {
+			h.DB.MessageOps().InsertMessage(*m)
+		}
+
+		if h.DB != nil {
+			h.RoomService.UpdateLastMessage(Room{ID: snap.roomID}, *m)
+		}
+		if h.RedisBroker != nil {
+			h.RedisBroker.PublishMessage(m.RoomID, m)
+		}
+	}
+
+	var firstname, lastname string
+	for _, member := range snap.members {
+		if member.Id == m.ClientID {
+			firstname = member.FirstName
+			lastname = member.LastName
+			break
+		}
+	}
+
+	// One shared outbound message for all local clients (writers only read).
+	out := *m
+	out.Deliver = nil
+	out.Read = nil
+	out.cachedRoomJSON = nil
+	needUnifiedJSON := false
+	for _, cl := range snap.clients {
+		if cl != nil && cl.UnifiedConn {
+			needUnifiedJSON = true
+			break
+		}
+	}
+	if needUnifiedJSON {
+		if raw, err := json.Marshal(roomMessageOut{
+			EventType: "roomMessage",
+			RoomID:    out.RoomID,
+			Content:   &out,
+		}); err == nil {
+			out.cachedRoomJSON = raw
+		}
+	}
+	outPtr := &out
+
+	// Offline pup-messages: snapshot users under one RLock, send after unlock.
+	var pupUsers []*User
+	h.mx.RLock()
+	for _, member := range snap.members {
+		if member.Id == m.ClientID || snap.hasClient(member.Id) {
+			continue
+		}
+		if user, ok := h.Users[member.Id]; ok && user != nil {
+			pupUsers = append(pupUsers, user)
+		}
+	}
+	h.mx.RUnlock()
+	for _, user := range pupUsers {
+		user.trySendPupMessage(&PupMessage{
+			MessageId: m.ID,
+			RoomId:    m.RoomID,
+			Firstname: firstname,
+			Lastname:  lastname,
+			Content:   m.Content,
+			Type:      m.Type,
+		})
+	}
+
+	if !isRemote && h.Ntfy != nil && m.ClientID != "" {
+		senderName := firstname
+		if lastname != "" {
+			senderName += " " + lastname
+		}
+		if senderName == "" || senderName == " " {
+			senderName = m.Username
+		}
+		if senderName == "" {
+			senderName = "کاربر"
+		}
+		for _, member := range snap.members {
+			if member.Id == m.ClientID || snap.hasClient(member.Id) {
+				continue
+			}
+			go h.Ntfy.NotifyNewMessage(member.Id, senderName, m.Content, m.RoomID, m.Type, "")
+		}
+	}
+
+	var deliverIDs []string
+	for _, cl := range snap.clients {
+		if cl == nil {
+			continue
+		}
+		if cl.ID != m.ClientID {
+			deliverIDs = append(deliverIDs, cl.ID)
+		}
+		cl.trySendMessage(outPtr)
+	}
+	if !isRemote && len(deliverIDs) > 0 && h.DB != nil {
+		deliver := append([]string(nil), deliverIDs...)
+		_ = h.DB.MessageOps().MessageDelivery(m.ID, deliver)
 	}
 }
 
@@ -450,8 +611,13 @@ func (h *Hub) Manager() {
 		select {
 		case req := <-h.AddConnection:
 			h.mx.Lock()
-			if userExists, ok := h.Users[req.UserId]; ok {
-				userExists.Conn[req.ConnectionId] = req.Conn
+			if userExists, ok := h.Users[req.UserId]; ok && userExists != nil {
+				userExists.mx.Lock()
+				if !userExists.closed {
+					userExists.Conn[req.ConnectionId] = req.Conn
+					userExists.IsConnected = true
+				}
+				userExists.mx.Unlock()
 				if h.PresenceManager != nil {
 					h.PresenceManager.AddUserConnection(req.UserId, req.ConnectionId)
 				}
@@ -461,8 +627,13 @@ func (h *Hub) Manager() {
 		case req := <-h.AddUnifiedConnection:
 			h.mx.Lock()
 			isNewUser := false
-			if userExists, ok := h.Users[req.UserId]; ok {
-				userExists.Conn[req.ConnectionId] = req.Conn
+			if userExists, ok := h.Users[req.UserId]; ok && userExists != nil {
+				userExists.mx.Lock()
+				if !userExists.closed {
+					userExists.Conn[req.ConnectionId] = req.Conn
+					userExists.IsConnected = true
+				}
+				userExists.mx.Unlock()
 			} else {
 				isNewUser = true
 				user := &User{
@@ -470,11 +641,7 @@ func (h *Hub) Manager() {
 					UserId: req.UserId,
 					online: true,
 				}
-				user.roomStatuses = make(chan *RoomStatus)
-				user.pupMessage = make(chan *PupMessage)
-				user.chanelNotification = make(chan *SystemMessage)
-				user.createRoom = make(chan *Room)
-				user.seenMessage = make(chan *SeenNotification)
+				newUserChannels(user)
 				go user.WireRooms(h)
 				h.Users[req.UserId] = user
 			}
@@ -486,25 +653,31 @@ func (h *Hub) Manager() {
 			}
 			h.mx.Unlock()
 		case user, _ := <-h.Join:
-
 			h.mx.Lock()
-			if userExists, ok := h.Users[user.UserId]; ok {
+			if userExists, ok := h.Users[user.UserId]; ok && userExists != nil {
+				userExists.mx.Lock()
 				userExists.Conn = mergeConnection(userExists.Conn, user.Conn)
+				userExists.IsConnected = !userExists.closed && len(userExists.Conn) > 0
+				userExists.mx.Unlock()
+				connIDs := make([]string, 0, len(user.Conn))
 				for s := range user.Conn {
+					connIDs = append(connIDs, s)
+				}
+				for _, s := range connIDs {
 					if h.PresenceManager != nil {
 						h.PresenceManager.AddUserConnection(user.UserId, s)
 					}
 					go userExists.userConnection(h, s)
 				}
 			} else {
-				user.roomStatuses = make(chan *RoomStatus)
-				user.pupMessage = make(chan *PupMessage)
-				user.chanelNotification = make(chan *SystemMessage)
-				user.createRoom = make(chan *Room)
-				user.seenMessage = make(chan *SeenNotification)
+				newUserChannels(user)
 				go user.WireRooms(h)
 				h.Users[user.UserId] = user
+				connIDs := make([]string, 0, len(user.Conn))
 				for s := range user.Conn {
+					connIDs = append(connIDs, s)
+				}
+				for _, s := range connIDs {
 					if h.PresenceManager != nil {
 						h.PresenceManager.AddUserConnection(user.UserId, s)
 					}
@@ -517,17 +690,23 @@ func (h *Hub) Manager() {
 			h.mx.Lock()
 			u, exists := h.Users[uc.Userid]
 			if exists && u != nil {
+				u.mx.Lock()
 				delete(u.Conn, uc.ConnectionId)
+				empty := len(u.Conn) == 0
+				u.mx.Unlock()
 				if h.PresenceManager != nil {
 					h.PresenceManager.RemoveUserConnection(uc.Userid, uc.ConnectionId)
 				}
-				if len(u.Conn) == 0 {
+				if empty {
 					now := time.Now().Unix()
+					delete(h.Users, uc.Userid)
+					u.shutdown()
 					go func() {
-						h.DB.UserOps().UpdateLastSeen(uc.Userid, now)
+						if h.DB != nil {
+							h.DB.UserOps().UpdateLastSeen(uc.Userid, now)
+						}
 						h.updateMembersLastSeen(uc.Userid, now)
 					}()
-					delete(h.Users, uc.Userid)
 					go h.OnlineMessage(uc.Userid, offline)
 				}
 			}
@@ -536,7 +715,6 @@ func (h *Hub) Manager() {
 		case user, _ := <-h.Evade:
 			go h.OnlineMessage(user.UserId, evade)
 		}
-
 	}
 }
 
@@ -547,15 +725,12 @@ func (h *Hub) OnlineMessage(userId string, status status) {
 	rooms := h.DB.RoomOps().GetOlineMyRooms(userId)
 	for _, room := range rooms {
 		for _, client := range room.Members {
-			if client.Id != userId {
-				if user, ok := h.Users[client.Id]; ok {
-					user.roomStatuses <- &RoomStatus{
-						RoomId: room.ID,
-						Status: status,
-					}
-				}
+			if client.Id == userId {
+				continue
 			}
-
+			if user, ok := h.getUserLocked(client.Id); ok && user != nil {
+				user.trySendRoomStatus(&RoomStatus{RoomId: room.ID, Status: status})
+			}
 		}
 	}
 
@@ -566,7 +741,6 @@ func (h *Hub) OnlineMessage(userId string, status status) {
 			h.PresenceManager.BroadcastUserOffline(userId, rooms)
 		}
 	}
-
 }
 
 func (h *Hub) updateMembersLastSeen(userId string, lastSeen int64) {
@@ -582,7 +756,8 @@ func (h *Hub) updateMembersLastSeen(userId string, lastSeen int64) {
 			}
 		}
 		h.DB.RoomOps().UpdateMember(room)
-		if r, ok := h.Rooms[room.ID]; ok {
+		h.mx.Lock()
+		if r, ok := h.Rooms[room.ID]; ok && r != nil {
 			for i, m := range r.Members {
 				if m.Id == userId {
 					r.Members[i].LastSeen = lastSeen
@@ -590,6 +765,7 @@ func (h *Hub) updateMembersLastSeen(userId string, lastSeen int64) {
 				}
 			}
 		}
+		h.mx.Unlock()
 	}
 }
 

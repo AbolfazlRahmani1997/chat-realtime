@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"server/internal/admin"
 	"server/internal/ws"
@@ -60,6 +61,21 @@ func InitRouter(wsHandler *ws.Handler, adminHandler *admin.Handler) {
 	adminRouter.GET("/room/:roomId", adminHandler.FindRoom)
 	adminRouter.PUT("/room/:roomId/deactive", adminHandler.DeactiveRoom)
 	adminRouter.PUT("/room/:roomId/active", adminHandler.ActiveRoom)
+
+	// Enable with ENABLE_PPROF=1 — do not expose publicly in production without auth.
+	if os.Getenv("ENABLE_PPROF") == "1" {
+		pprofGroup := r.Group("/debug/pprof")
+		pprofGroup.GET("/", gin.WrapF(pprof.Index))
+		pprofGroup.GET("/cmdline", gin.WrapF(pprof.Cmdline))
+		pprofGroup.GET("/profile", gin.WrapF(pprof.Profile))
+		pprofGroup.GET("/symbol", gin.WrapF(pprof.Symbol))
+		pprofGroup.GET("/trace", gin.WrapF(pprof.Trace))
+		pprofGroup.GET("/heap", gin.WrapH(pprof.Handler("heap")))
+		pprofGroup.GET("/goroutine", gin.WrapH(pprof.Handler("goroutine")))
+		pprofGroup.GET("/allocs", gin.WrapH(pprof.Handler("allocs")))
+		pprofGroup.GET("/block", gin.WrapH(pprof.Handler("block")))
+		pprofGroup.GET("/mutex", gin.WrapH(pprof.Handler("mutex")))
+	}
 }
 
 func Start(addr string) error {

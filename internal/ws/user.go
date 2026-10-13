@@ -38,6 +38,7 @@ type PupMessage struct {
 	Content   string `json:"content"`
 	Type      string `json:"type,omitempty"`
 }
+
 type SeenNotification struct {
 	MessageId string `json:"message_id,omitempty"`
 	RoomId    string `json:"room_id,omitempty"`
@@ -49,87 +50,167 @@ type UserConnection struct {
 }
 
 type User struct {
-	mx                 sync.Mutex
-	IsConnected        bool
-	Conn               map[string]ConnWriter
-	StatusConnection   *websocket.Conn
-	online             bool
-	UserId             string `json:"UserId"`
-	roomStatuses       chan *RoomStatus
-	createRoom         chan *Room
-	chanelNotification chan *SystemMessage
-	pupMessage         chan *PupMessage
-	seenMessage        chan *SeenNotification
-	roomList           chan bool
+	mx           sync.Mutex
+	closed       bool
+	IsConnected  bool
+	Conn         map[string]ConnWriter
+	StatusConnection *websocket.Conn
+	online       bool
+	UserId       string `json:"UserId"`
+	roomStatuses chan *RoomStatus
+	createRoom   chan *Room
+	pupMessage   chan *PupMessage
+	seenMessage  chan *SeenNotification
 }
 
-func (User *User) WireRooms(h *Hub) {
-	defer func() {
+func newUserChannels(u *User) {
+	u.roomStatuses = make(chan *RoomStatus, 32)
+	u.pupMessage = make(chan *PupMessage, 32)
+	u.createRoom = make(chan *Room, 16)
+	u.seenMessage = make(chan *SeenNotification, 32)
+	u.IsConnected = true
+}
 
-	}()
-	var wg sync.WaitGroup
+// shutdown closes notification channels exactly once so WireRooms can exit
+// and in-flight senders do not panic on a closed channel.
+// Channel fields are left non-nil so WireRooms can observe the close.
+func (u *User) shutdown() {
+	if u == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	u.closed = true
+	u.IsConnected = false
+	close(u.roomStatuses)
+	close(u.createRoom)
+	close(u.pupMessage)
+	close(u.seenMessage)
+}
+
+func (u *User) trySendRoomStatus(st *RoomStatus) {
+	if u == nil || st == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	select {
+	case u.roomStatuses <- st:
+	default:
+	}
+}
+
+func (u *User) trySendCreateRoom(room *Room) {
+	if u == nil || room == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	select {
+	case u.createRoom <- room:
+	default:
+	}
+}
+
+func (u *User) trySendPupMessage(msg *PupMessage) {
+	if u == nil || msg == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	select {
+	case u.pupMessage <- msg:
+	default:
+	}
+}
+
+func (u *User) trySendSeen(n *SeenNotification) {
+	if u == nil || n == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	select {
+	case u.seenMessage <- n:
+	default:
+	}
+}
+
+func (u *User) hasConnections() bool {
+	if u == nil {
+		return false
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	return !u.closed && len(u.Conn) > 0
+}
+
+func (u *User) WireRooms(h *Hub) {
 	for {
 		select {
-		case roomStatuses, ok := <-User.roomStatuses:
-			if ok {
-				wg.Add(1)
-				go User.writeInAll(&wg)
-				User.chanelNotification <- &SystemMessage{EventType: roomStatus, Content: roomStatuses}
-				wg.Wait()
+		case st, ok := <-u.roomStatuses:
+			if !ok {
+				return
 			}
-		case roomStatuses, ok := <-User.createRoom:
-
-			if ok {
-				wg.Add(1)
-				go User.writeInAll(&wg)
-				User.chanelNotification <- &SystemMessage{EventType: createNewRoom, Content: roomStatuses}
-				wg.Wait()
+			u.dispatch(&SystemMessage{EventType: roomStatus, Content: st})
+		case room, ok := <-u.createRoom:
+			if !ok {
+				return
 			}
-		case notification, ok := <-User.pupMessage:
-			{
-				if ok {
-					wg.Add(1)
-					go User.writeInAll(&wg)
-					User.chanelNotification <- &SystemMessage{EventType: incomeMessage, Content: notification}
-					wg.Wait()
-				}
+			u.dispatch(&SystemMessage{EventType: createNewRoom, Content: room})
+		case notification, ok := <-u.pupMessage:
+			if !ok {
+				return
 			}
-		case notification, ok := <-User.seenMessage:
-			{
-				if ok {
-					wg.Add(1)
-					go User.writeInAll(&wg)
-					User.chanelNotification <- &SystemMessage{EventType: seenMessage, Content: notification}
-					wg.Wait()
-				}
+			u.dispatch(&SystemMessage{EventType: incomeMessage, Content: notification})
+		case notification, ok := <-u.seenMessage:
+			if !ok {
+				return
 			}
-
+			u.dispatch(&SystemMessage{EventType: seenMessage, Content: notification})
 		}
 	}
 }
 
-func (User *User) writeInAll(wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	select {
-	case sysMessage, ok := <-User.chanelNotification:
-		if !ok {
-			return
+func (u *User) dispatch(sysMessage *SystemMessage) {
+	if sysMessage == nil {
+		return
+	}
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	if u.closed {
+		return
+	}
+	var toRemove []string
+	for s, conn := range u.Conn {
+		if conn == nil {
+			toRemove = append(toRemove, s)
+			continue
 		}
-		User.mx.Lock()
-		var toRemove []string
-		for s, conn := range User.Conn {
-			if err := conn.WriteJSON(sysMessage); err != nil {
-				toRemove = append(toRemove, s)
-			}
+		if err := conn.WriteJSON(sysMessage); err != nil {
+			toRemove = append(toRemove, s)
 		}
-		for _, s := range toRemove {
-			delete(User.Conn, s)
-		}
-		if len(User.Conn) == 0 {
-			User.IsConnected = false
-		}
-		User.mx.Unlock()
+	}
+	for _, s := range toRemove {
+		delete(u.Conn, s)
+	}
+	if len(u.Conn) == 0 {
+		u.IsConnected = false
 	}
 }
 
@@ -138,19 +219,29 @@ type MessageReceive struct {
 	Item        string    `json:"item,omitempty"`
 }
 
-func (User *User) userConnection(h *Hub, connectionId string) {
+func (u *User) userConnection(h *Hub, connectionId string) {
 	defer func() {
-		User.mx.Lock()
-		if c, exists := User.Conn[connectionId]; exists {
-			_ = c.Close()
-			delete(User.Conn, connectionId)
-			h.Left <- &UserConnection{Userid: User.UserId, ConnectionId: connectionId}
+		u.mx.Lock()
+		c, exists := u.Conn[connectionId]
+		if exists {
+			delete(u.Conn, connectionId)
 		}
-		User.mx.Unlock()
+		u.mx.Unlock()
+		if exists && c != nil {
+			_ = c.Close()
+		}
+		if exists {
+			// Never hold User.mx while sending on Hub channels (Manager may need User.mx).
+			select {
+			case h.Left <- &UserConnection{Userid: u.UserId, ConnectionId: connectionId}:
+			default:
+				// Manager backlog; presence cleanup may lag until next reconnect.
+			}
+		}
 	}()
-	User.mx.Lock()
-	conn := User.Conn[connectionId]
-	User.mx.Unlock()
+	u.mx.Lock()
+	conn := u.Conn[connectionId]
+	u.mx.Unlock()
 	if conn == nil {
 		return
 	}
@@ -165,14 +256,17 @@ func (User *User) userConnection(h *Hub, connectionId string) {
 				if err != nil {
 					break
 				}
-				err = conn.WriteJSON(SystemMessage{EventType: listRooms, Content: h.RoomService.GetMyRoom(User.UserId, item, "")})
+				err = conn.WriteJSON(SystemMessage{EventType: listRooms, Content: h.RoomService.GetMyRoom(u.UserId, item, "")})
 				if err != nil {
 					fmt.Println("error reading message:", err)
 					break
 				}
 
 			case seenMessage:
-				h.ReadAble <- &ReadMessage{MessageId: item, UserId: User.UserId}
+				select {
+				case h.ReadAble <- &ReadMessage{MessageId: item, UserId: u.UserId}:
+				default:
+				}
 			}
 
 		}
@@ -180,14 +274,12 @@ func (User *User) userConnection(h *Hub, connectionId string) {
 		var message []byte
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-
 			fmt.Println(err)
 			break
 		}
 		if len(message) > 0 {
 			err = json.Unmarshal(message, &messageClient)
 			if err != nil {
-
 				break
 			}
 			eventRequest = messageClient.RequestType
@@ -195,7 +287,5 @@ func (User *User) userConnection(h *Hub, connectionId string) {
 		} else {
 			item = ""
 		}
-
 	}
-
 }

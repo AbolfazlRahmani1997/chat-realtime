@@ -8,3 +8,8 @@
 web/node_modules
 web/dist
 
+
+# test/profile binaries
+ws.test
+*.prof
+profiles/*.prof
