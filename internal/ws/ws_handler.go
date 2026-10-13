@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +29,7 @@ var upgrader = websocket.Upgrader{
 
 type Handler struct {
 	hub         *Hub
+	userMu      sync.RWMutex
 	UserHandler map[string]UserRequest // cache for Gateway-validated tokens only
 	MockUsers   map[string]UserRequest // mock users from file; not mixed with UserHandler
 	MessageService
@@ -72,11 +73,13 @@ func (Handler *Handler) UpdateUserPool() {
 	for {
 		select {
 		case <-ticker.C:
+			Handler.userMu.Lock()
 			for i := range Handler.UserHandler {
 				if Handler.UserHandler[i].Time.Before(time.Now()) {
 					delete(Handler.UserHandler, i)
 				}
 			}
+			Handler.userMu.Unlock()
 		}
 	}
 }
@@ -141,21 +144,11 @@ func (Handler *Handler) EditRoom(c *gin.Context) {
 		return
 	}
 
-	// update hub cache if room is loaded
-	if cached, ok := Handler.hub.Rooms[roomId]; ok {
-		if req.Name != "" {
-			cached.Name = req.Name
-		}
-		if req.AvatarUrl != "" {
-			cached.AvatarUrl = req.AvatarUrl
-		}
-		if req.Type != "" {
-			cached.Type = req.Type
-		}
-		if len(req.Members) > 0 {
-			cached.Members = req.Members
-		}
+	var members []Member
+	if len(req.Members) > 0 {
+		members = req.Members
 	}
+	Handler.hub.PatchCachedRoom(roomId, req.Name, req.AvatarUrl, req.Type, members)
 
 	c.JSON(http.StatusOK, room)
 }
@@ -178,16 +171,7 @@ func (Handler *Handler) CreateRoom(c *gin.Context) {
 	// اگر اتاق از قبل وجود داشته باشد، فقط آن را در Hub ثبت می‌کنیم
 	existing := Handler.hub.DB.MessageOps().GetRoom(req.ID)
 	if existing.ID != "" {
-		Handler.hub.Rooms[existing.ID] = &Room{
-			_Id:     existing._Id,
-			ID:      existing.ID,
-			Name:    existing.Name,
-			Type:    existing.Type,
-			Members: existing.Members,
-			Status:  existing.Status,
-			Message: existing.Message,
-			Clients: make(map[string]*Client),
-		}
+		Handler.hub.EnsureRoom(existing)
 		c.JSON(http.StatusOK, req)
 		return
 	}
@@ -280,9 +264,7 @@ func (Handler *Handler) SetRoomAvatar(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if cached, ok := Handler.hub.Rooms[roomId]; ok {
-		cached.AvatarUrl = req.AvatarUrl
-	}
+	Handler.hub.SetCachedRoomAvatar(roomId, req.AvatarUrl)
 	c.JSON(http.StatusOK, gin.H{"message": "avatar updated"})
 }
 
@@ -323,28 +305,24 @@ func (Handler *Handler) JoinRoom(c *gin.Context) {
 	}
 
 	go Handler.hub.RoomService.SyncUser(room)
-	if _, ok := Handler.hub.Rooms[roomID]; !ok {
-		Handler.hub.Room <- &room
-	}
+	Handler.hub.EnsureRoom(room)
 	var cl *Client
 	connectionPool := make(map[string]ConnWriter)
-	connectionPool[ulid.Make().String()] = conn
+	connectionPool[ulid.Make().String()] = &syncConn{Conn: conn}
 
 	cl = &Client{
 		Conn:          connectionPool,
 		ID:            clientID,
 		RoomID:        roomID,
-		ChanelMessage: make(chan *Message),
+		ChanelMessage: make(chan *Message, clientMessageBuffer),
+		Message:       newClientMessageChan(),
 		Status:        online,
 	}
 	if !canWriteVal {
-		cl.Message = make(chan *Message, 3)
 		if errW := conn.WriteJSON([]string{"templates", "Salam Chetori", "ساعت ازاد کن "}); errW != nil {
 			conn.Close()
 			return
 		}
-	} else {
-		cl.Message = make(chan *Message)
 	}
 
 	Handler.hub.Register <- cl
@@ -396,22 +374,19 @@ func (Handler *Handler) GetRooms(c *gin.Context) {
 		}
 	}
 	// اگر کاربر از قبل در Hub هست، فقط این اتصال را به همان User اضافه کن تا connectionهای قبلی (مثلاً تب دیگر) از بین نروند
-	Handler.hub.mx.RLock()
-	_, exists := Handler.hub.Users[userId]
-	Handler.hub.mx.RUnlock()
-	if exists {
+	wrapped := &syncConn{Conn: conn}
+	if Handler.hub.UserExists(userId) {
 		connectionId := ulid.Make().String()
-		Handler.hub.AddConnection <- &AddConnectionRequest{UserId: userId, ConnectionId: connectionId, Conn: conn}
+		Handler.hub.AddConnection <- &AddConnectionRequest{UserId: userId, ConnectionId: connectionId, Conn: wrapped}
 		return
 	}
 	connectionId := ulid.Make().String()
 	user := &User{
-		Conn:   map[string]ConnWriter{connectionId: conn},
+		Conn:   map[string]ConnWriter{connectionId: wrapped},
 		UserId: userId,
 		online: true,
 	}
 	Handler.hub.Join <- user
-
 }
 
 // UnifiedIncoming is the JSON shape for client-to-server events on the unified WebSocket.
@@ -466,6 +441,13 @@ func (h *Handler) UnifiedWS(c *gin.Context) {
 func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, connectionId string, userId string, username string) {
 	defer func() {
 		_ = rawConn.Close()
+		for _, cl := range h.hub.CollectUnifiedClientsForConn(userId, connectionId) {
+			select {
+			case h.hub.Unregister <- cl:
+			default:
+				cl.shutdown()
+			}
+		}
 		h.hub.Left <- &UserConnection{Userid: userId, ConnectionId: connectionId}
 	}()
 
@@ -511,42 +493,16 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 					continue
 				}
 			}
-			canWriteVal := canWrite(userId, room.Members)
 			go h.hub.RoomService.SyncUser(room)
-			if _, ok := h.hub.Rooms[roomID]; !ok {
-				h.hub.Room <- &room
-				for i := 0; i < 200; i++ {
-					if _, ok := h.hub.Rooms[roomID]; ok {
-						break
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-				if _, ok := h.hub.Rooms[roomID]; !ok {
-					log.Printf("unifiedWS: forcing room %s creation in hub", roomID)
-					h.hub.mx.Lock()
-					h.hub.Rooms[roomID] = &Room{
-						ID:      room.ID,
-						Name:    room.Name,
-						Type:    room.Type,
-						Members: room.Members,
-						Status:  room.Status,
-						Clients: make(map[string]*Client),
-					}
-					h.hub.mx.Unlock()
-				}
-			}
+			h.hub.EnsureRoom(room)
 			cl := &Client{
 				Conn:          map[string]ConnWriter{connectionId: writeConn},
 				ID:            userId,
 				RoomID:        roomID,
-				ChanelMessage: make(chan *Message, 20),
+				ChanelMessage: make(chan *Message, clientMessageBuffer),
+				Message:       newClientMessageChan(),
 				Status:        online,
 				UnifiedConn:   true,
-			}
-			if !canWriteVal {
-				cl.Message = make(chan *Message, 3)
-			} else {
-				cl.Message = make(chan *Message)
 			}
 			h.hub.Register <- cl
 			go cl.writeMessage()
@@ -569,10 +525,8 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 			if roomID == "" {
 				continue
 			}
-			if room, ok := h.hub.Rooms[roomID]; ok {
-				if cl, ok := room.Clients[userId]; ok {
-					h.hub.Unregister <- cl
-				}
+			if cl, ok := h.hub.GetRoomClient(roomID, userId); ok {
+				h.hub.Unregister <- cl
 			}
 		case "sendMessage":
 			roomID := incoming.RoomID
@@ -581,12 +535,12 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 			if roomID == "" || ulidVal == "" {
 				continue
 			}
-			room, ok := h.hub.Rooms[roomID]
+			room, ok := h.hub.GetRoomSnapshot(roomID)
 			if !ok {
 				continue
 			}
-			cl, ok := room.Clients[userId]
-			if !ok {
+			cl, ok := h.hub.GetRoomClient(roomID, userId)
+			if !ok || cl == nil {
 				continue
 			}
 			if ulidVal == "ping" {
@@ -609,7 +563,10 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 				ClientID: userId,
 				ReplyTo:  incoming.ReplyTo,
 			}
-			cl.ChanelMessage <- msg
+			if !cl.trySendChanel(msg) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "busy", "room_id": roomID})
+				continue
+			}
 			_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "deliverMessage", "Content": ulidVal, "room_id": roomID})
 
 			if room.Type == BOT {
@@ -630,13 +587,13 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "message not found"})
 				continue
 			}
-			if _, ok := h.hub.Rooms[targetRoomID]; !ok {
+			if !h.hub.RoomExists(targetRoomID) {
 				targetRoom := h.hub.DB.RoomOps().GetById(targetRoomID)
 				if targetRoom.ID == "" {
 					_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "target room not found"})
 					continue
 				}
-				h.hub.Room <- &targetRoom
+				h.hub.EnsureRoom(targetRoom)
 			}
 			fwdMsg := &Message{
 				Content:  original.Content,
@@ -652,7 +609,7 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 					Username:   original.Username,
 				},
 			}
-			h.hub.Broadcast <- fwdMsg
+			h.hub.EnqueueBroadcast(fwdMsg)
 			_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "deliverMessage", "Content": fwdMsg.UniqId, "room_id": targetRoomID})
 		case "ping":
 			_ = writeConn.WriteJSON(SystemMessage{EventType: deliverMessage, Content: "ping"})
@@ -686,10 +643,7 @@ func (Handler *Handler) SyncRoom(c *gin.Context) {
 		return
 	}
 	userId := strconv.Itoa(userAuthed.Id)
-	Handler.hub.mx.RLock()
-	_, exists := Handler.hub.Users[userId]
-	Handler.hub.mx.RUnlock()
-	if !exists {
+	if !Handler.hub.UserExists(userId) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found in hub; connect via getRooms first"})
 		return
 	}
@@ -699,15 +653,10 @@ func (Handler *Handler) SyncRoom(c *gin.Context) {
 		return
 	}
 	connectionId := ulid.Make().String()
-	Handler.hub.AddConnection <- &AddConnectionRequest{UserId: userId, ConnectionId: connectionId, Conn: conn}
+	Handler.hub.AddConnection <- &AddConnectionRequest{UserId: userId, ConnectionId: connectionId, Conn: &syncConn{Conn: conn}}
 }
 func (Handler *Handler) ReadMessage(c *gin.Context) {
 	roomId := c.Param("roomId")
-	room, ok := Handler.hub.Rooms[roomId]
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "room not found"})
-		return
-	}
 	token := c.Query("token")
 	token = fmt.Sprintf("%s", token)
 	userAuthed, errAuth := Handler.getUser(token)
@@ -716,8 +665,8 @@ func (Handler *Handler) ReadMessage(c *gin.Context) {
 		return
 	}
 	userId := strconv.Itoa(userAuthed.Id)
-	client, ok := room.Clients[userId]
-	if !ok {
+	client, ok := Handler.hub.GetRoomClient(roomId, userId)
+	if !ok || client == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "client not found in room; join room first"})
 		return
 	}
@@ -726,7 +675,7 @@ func (Handler *Handler) ReadMessage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	client.ReadMessage = conn
+	client.setReadConn(conn)
 	client.seenMessage(Handler.hub)
 }
 
@@ -743,9 +692,7 @@ func (Handler *Handler) UpdatePin(c *gin.Context) {
 	userId := strconv.Itoa(user.Id)
 
 	newMember := Handler.hub.RoomService.updateRoomSpecification(roomId, userId, spefic)
-	if _, ok := Handler.hub.Rooms[roomId]; ok {
-		Handler.hub.Rooms[roomId].Members = newMember
-	}
+	Handler.hub.SetCachedRoomMembers(roomId, newMember)
 	for _, member := range newMember {
 		if member.Id == userId {
 			spefic.Pin = member.Pin
@@ -768,9 +715,7 @@ func (Handler *Handler) UpdateNotification(c *gin.Context) {
 	roomId := c.Param("roomId")
 	userId := strconv.Itoa(user.Id)
 	newMember := Handler.hub.RoomService.updateRoomSpecification(roomId, userId, spefic)
-	if _, ok := Handler.hub.Rooms[roomId]; ok {
-		Handler.hub.Rooms[roomId].Members = newMember
-	}
+	Handler.hub.SetCachedRoomMembers(roomId, newMember)
 
 	for _, member := range newMember {
 		if member.Id == userId {
@@ -787,19 +732,8 @@ type ClientRes struct {
 }
 
 func (Handler *Handler) GetClients(c *gin.Context) {
-	var clients []ClientRes
 	roomId := c.Param("roomId")
-	if _, ok := Handler.hub.Rooms[roomId]; !ok {
-		clients = make([]ClientRes, 0)
-		c.JSON(http.StatusOK, clients)
-		return
-	}
-	for _, cl := range Handler.hub.Rooms[roomId].Clients {
-		clients = append(clients, ClientRes{
-			ID:       cl.ID,
-			Username: cl.Username,
-		})
-	}
+	clients := Handler.hub.ListRoomClientRes(roomId)
 	c.JSON(http.StatusOK, clients)
 }
 func hasAccess(val interface{}, array interface{}, access interface{}) (exists bool, index int, role interface{}) {
@@ -945,15 +879,9 @@ func (h *Handler) forwardToBot(msg *Message, writeConn ConnWriter, connectionId 
 		connectionId: connectionId,
 	}
 
-	h.hub.mx.RLock()
-	room, ok := h.hub.Rooms[msg.RoomID]
-	h.hub.mx.RUnlock()
-	if !ok {
-		return
-	}
-	if cl, ok := room.Clients[msg.ClientID]; ok {
+	if cl, ok := h.hub.GetRoomClient(msg.RoomID, msg.ClientID); ok && cl != nil {
 		botMsg.connectionId = ""
-		cl.Message <- botMsg
+		cl.trySendMessage(botMsg)
 	}
 }
 
@@ -966,10 +894,11 @@ func (h *Handler) getUser(token string) (UserRequest, error) {
 		}
 		return user, errors.New("unauthorized: token not in mock users")
 	}
-	if userRequest, ok := h.UserHandler[token]; ok {
-		if userRequest.Id != 0 {
-			return userRequest, nil
-		}
+	h.userMu.RLock()
+	userRequest, cached := h.UserHandler[token]
+	h.userMu.RUnlock()
+	if cached && userRequest.Id != 0 {
+		return userRequest, nil
 	}
 	client := &http.Client{}
 	gateway := fmt.Sprintf("%s/api/auth/user", os.Getenv("GATEWAY_URL"))
@@ -1000,7 +929,9 @@ func (h *Handler) getUser(token string) (UserRequest, error) {
 	}
 	user.LastStatusCode = res.StatusCode
 	user.Time = time.Now()
+	h.userMu.Lock()
 	h.UserHandler[token] = user
+	h.userMu.Unlock()
 	h.UpdateUser(UserDto{UserId: strconv.Itoa(user.Id), UserName: user.FirstName + user.LastName, FirstName: user.FirstName, LastName: user.LastName, AvatarUrl: user.Avatar})
 	return user, nil
 }

@@ -4,19 +4,15 @@ import (
 	ScyllaRepo "server/adapters/Reporisotires/ScyllaDB"
 	"server/internal/ws"
 	"server/ports/reporisoties"
+
+	"github.com/gocql/gocql"
 )
 
-func initScyllaProvider() ws.DatabaseProvider {
+// initScylla wires one shared session for Hub provider + admin repositories.
+func initScylla() (ws.DatabaseProvider, reporisoties.RoomRepositoryPort, reporisoties.MessageRepositoryPort, *gocql.Session) {
 	session := ScyllaRepo.NewSession()
-
-	return ws.NewScyllaProvider(session)
-}
-
-func initScyllaRepos() (reporisoties.RoomRepositoryPort, reporisoties.MessageRepositoryPort) {
-	session := ScyllaRepo.NewSession()
-
-	roomRepo := ScyllaRepo.NewRoomRepository(session)
-	messageRepo := ScyllaRepo.NewMessageRepository(session)
-
-	return roomRepo, messageRepo
+	return ws.NewScyllaProvider(session),
+		ScyllaRepo.NewRoomRepository(session),
+		ScyllaRepo.NewMessageRepository(session),
+		session
 }

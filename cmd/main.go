@@ -14,6 +14,7 @@ import (
 	"server/ports/reporisoties"
 	"server/router"
 
+	"github.com/gocql/gocql"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -87,7 +88,9 @@ func main() {
 
 	switch dbDriver {
 	case "scylla", "scylladb":
-		dbProvider = initScyllaProvider()
+		var scyllaSession *gocql.Session
+		dbProvider, roomRepository, messageRepository, scyllaSession = initScylla()
+		_ = scyllaSession
 		mongoClient = nil
 
 	default:

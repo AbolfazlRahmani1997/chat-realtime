@@ -1,7 +1,6 @@
 package ws
 
 import (
-	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -43,28 +42,23 @@ func (p *ScyllaProvider) InsertMessageFlat(msgId string, content string, msgType
 		id = newULID()
 	}
 
-	err := p.Session.Query(`INSERT INTO messages (id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, content, msgType, roomID,
-		username, clientID, uniqId, createdAt, updatedAt,
-	).Exec()
-	if err != nil {
-		log.Printf("Scylla InsertMessageFlat error: %v", err)
-		return
+	// UnloggedBatch: denormalized fan-out without coordinator round-trips.
+	b := p.Session.NewBatch(gocql.UnloggedBatch)
+	b.Query(`INSERT INTO messages (id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, content, msgType, roomID, username, clientID, uniqId, createdAt, updatedAt)
+	b.Query(`INSERT INTO messages_by_room (room_id, created_at, id, content, message_type, username, client_id, uniqid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		roomID, createdAt, id, content, msgType, username, clientID, uniqId)
+	if uniqId != "" {
+		b.Query(`INSERT INTO messages_by_uniqid (uniqid, id) VALUES (?, ?)`, uniqId, id)
 	}
-
-	err = p.Session.Query(`INSERT INTO messages_by_room (room_id, created_at, id, content, message_type, username, client_id, uniqid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		roomID, createdAt, id, content, msgType,
-		username, clientID, uniqId,
-	).Exec()
-	if err != nil {
-		log.Printf("Scylla InsertMessageFlat messages_by_room error: %v", err)
-	}
-
 	for _, cid := range deliver {
-		p.Session.Query(`INSERT INTO message_deliver (message_id, client_id) VALUES (?, ?)`, id, cid).Exec()
+		b.Query(`INSERT INTO message_deliver (message_id, client_id) VALUES (?, ?)`, id, cid)
 	}
 	for _, cid := range read {
-		p.Session.Query(`INSERT INTO message_read (message_id, client_id) VALUES (?, ?)`, id, cid).Exec()
+		b.Query(`INSERT INTO message_read (message_id, client_id) VALUES (?, ?)`, id, cid)
+	}
+	if err := p.Session.ExecuteBatch(b); err != nil {
+		log.Printf("Scylla InsertMessageFlat batch error: %v", err)
 	}
 }
 
@@ -74,13 +68,13 @@ func (p *ScyllaProvider) loadDeliverAndRead(id string) (deliver, read []string) 
 	for iter.Scan(&cid) {
 		deliver = append(deliver, cid)
 	}
-	iter.Close()
+	_ = iter.Close()
 
 	iter = p.Session.Query(`SELECT client_id FROM message_read WHERE message_id = ?`, id).Iter()
 	for iter.Scan(&cid) {
 		read = append(read, cid)
 	}
-	iter.Close()
+	_ = iter.Close()
 	return
 }
 
@@ -93,50 +87,51 @@ func mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid s
 	}
 }
 
-func (p *ScyllaProvider) GetMessageNotDelivery(roomId, userId string) []Message {
-	iter := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages WHERE room_id = ? AND client_id != ? ALLOW FILTERING`,
-		roomId, userId).Iter()
+func (p *ScyllaProvider) scanMessagesByRoom(roomId string, limit int) []Message {
+	iter := p.Session.Query(
+		`SELECT id, content, message_type, username, client_id, uniqid, created_at FROM messages_by_room WHERE room_id = ? LIMIT ?`,
+		roomId, limit,
+	).Iter()
 
 	var messages []Message
-	var id, content, msgType, roomID, username, clientID, uniqid string
-	var createdAt, updatedAt time.Time
+	var id, content, msgType, username, clientID, uniqid string
+	var createdAt time.Time
+	for iter.Scan(&id, &content, &msgType, &username, &clientID, &uniqid, &createdAt) {
+		d, r := p.loadDeliverAndRead(id)
+		messages = append(messages, mapMessageScylla(id, content, msgType, roomId, username, clientID, uniqid, createdAt, createdAt, d, r))
+	}
+	_ = iter.Close()
+	return messages
+}
 
-	for iter.Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt) {
-		d, _ := p.loadDeliverAndRead(id)
+func (p *ScyllaProvider) GetMessageNotDelivery(roomId, userId string) []Message {
+	// Partition-key read on messages_by_room — no ALLOW FILTERING.
+	recent := p.scanMessagesByRoom(roomId, 100)
+	var messages []Message
+	for _, m := range recent {
+		if m.ClientID == userId {
+			continue
+		}
 		delivered := false
-		for _, c := range d {
+		for _, c := range m.Deliver {
 			if c == userId {
 				delivered = true
 				break
 			}
 		}
 		if !delivered {
-			messages = append(messages, mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid, createdAt, updatedAt, d, nil))
+			messages = append(messages, m)
 		}
 	}
-	iter.Close()
 	return messages
 }
 
 func (p *ScyllaProvider) GetRoomMessages(roomId, userId string) []Message {
-	iter := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages_by_room WHERE room_id = ? LIMIT 1`,
-		roomId).Iter()
-
-	var messages []Message
-	var id, content, msgType, roomID, username, clientID, uniqid string
-	var createdAt, updatedAt time.Time
-
-	for iter.Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt) {
-		d, r := p.loadDeliverAndRead(id)
-		messages = append(messages, mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid, createdAt, updatedAt, d, r))
-	}
-	iter.Close()
-	return messages
+	return p.scanMessagesByRoom(roomId, 1)
 }
 
 func (p *ScyllaProvider) GetMessageNotCountDelivery(roomId, userId string) int64 {
-	msgs := p.GetMessageNotDelivery(roomId, userId)
-	return int64(len(msgs))
+	return int64(len(p.GetMessageNotDelivery(roomId, userId)))
 }
 
 func (p *ScyllaProvider) GetRoomMessage(roomId, page string) []Message {
@@ -145,98 +140,98 @@ func (p *ScyllaProvider) GetRoomMessage(roomId, page string) []Message {
 	if pageInt < 1 {
 		pageInt = 1
 	}
+	// Fetch only the current page window (avoid over-fetch + skip when possible).
+	need := pageInt * limit
+	all := p.scanMessagesByRoom(roomId, need)
 	skip := (pageInt - 1) * limit
-	fmt.Println(roomId)
-	iter := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at FROM messages_by_room WHERE room_id = ? ORDER BY created_at DESC LIMIT ?`,
-		roomId, limit+skip).Iter()
-
-	var messages []Message
-	var id, content, msgType, roomID, username, clientID, uniqid string
-	var createdAt, updatedAt time.Time
-
-	for iter.Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt) {
-		d, r := p.loadDeliverAndRead(id)
-		messages = append(messages, mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid, createdAt, updatedAt, d, r))
-	}
-	iter.Close()
-
-	if skip > 0 && len(messages) > skip {
-		messages = messages[skip:]
-	} else if skip > 0 {
+	if skip >= len(all) {
 		return nil
 	}
-	return messages
+	end := skip + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[skip:end]
 }
 
 func (p *ScyllaProvider) GetAllMessages(roomId, userId string) []Message {
-	iter := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages_by_room WHERE room_id = ? LIMIT 10`,
-		roomId).Iter()
+	return p.scanMessagesByRoom(roomId, 10)
+}
 
-	var messages []Message
-	var id, content, msgType, roomID, username, clientID, uniqid string
-	var createdAt, updatedAt time.Time
-
-	for iter.Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt) {
-		d, r := p.loadDeliverAndRead(id)
-		messages = append(messages, mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid, createdAt, updatedAt, d, r))
-	}
-	iter.Close()
-	return messages
+func (p *ScyllaProvider) upsertMember(roomID string, m Member, roomType Type) {
+	_ = p.Session.Query(
+		`INSERT INTO room_members (room_id, user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		roomID, m.Id, m.Roles, m.FirstName, m.LastName, m.AvatarUrl, m.Notification, m.Pin, m.LastSeen,
+	).Exec()
+	_ = p.Session.Query(
+		`INSERT INTO rooms_by_user (user_id, room_id, pin, room_type) VALUES (?, ?, ?, ?)`,
+		m.Id, roomID, m.Pin, string(roomType),
+	).Exec()
 }
 
 func (p *ScyllaProvider) InsertRoom(room Room) {
 	now := time.Now()
-	err := p.Session.Query(`INSERT INTO rooms (id, name, type, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		room.ID, room.Name, false, string(room.Status), now, now,
+	roomType := string(room.Type)
+	if roomType == "" {
+		roomType = string(GROUP)
+	}
+	err := p.Session.Query(
+		`INSERT INTO rooms (id, name, type, status, avatar_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		room.ID, room.Name, roomType, string(room.Status), room.AvatarUrl, now, now,
 	).Exec()
 	if err != nil {
 		log.Printf("Scylla InsertRoom error: %v", err)
 	}
-
 	for _, m := range room.Members {
-		p.Session.Query(`INSERT INTO room_members (room_id, user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			room.ID, m.Id, m.Roles, m.FirstName, m.LastName, m.AvatarUrl, m.Notification, m.Pin, m.LastSeen,
-		).Exec()
+		p.upsertMember(room.ID, m, room.Type)
 	}
 }
 
 func (p *ScyllaProvider) GetRoom(roomId string) Room {
-	var id, name, statusStr string
-	var temp bool
+	var id, name, roomType, statusStr, avatarURL string
 	var createdAt, updatedAt time.Time
 
-	err := p.Session.Query(`SELECT id, name, type, status, created_at, updated_at FROM rooms WHERE id = ?`,
-		roomId).Scan(&id, &name, &temp, &statusStr, &createdAt, &updatedAt)
+	err := p.Session.Query(
+		`SELECT id, name, type, status, avatar_url, created_at, updated_at FROM rooms WHERE id = ?`,
+		roomId,
+	).Scan(&id, &name, &roomType, &statusStr, &avatarURL, &createdAt, &updatedAt)
 	if err != nil {
 		return Room{}
 	}
 
-	room := Room{ID: id, Name: name, Status: status(statusStr)}
+	room := Room{
+		ID: id, Name: name, Type: Type(roomType),
+		AvatarUrl: avatarURL, Status: status(statusStr),
+	}
 
-	mIter := p.Session.Query(`SELECT user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen FROM room_members WHERE room_id = ?`, roomId).Iter()
-	var userID, firstname, lastname, avatarURL string
+	mIter := p.Session.Query(
+		`SELECT user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen FROM room_members WHERE room_id = ?`,
+		roomId,
+	).Iter()
+	var userID, firstname, lastname, memberAvatar string
 	var roles []string
 	var notification, pin bool
 	var lastSeen int64
-	for mIter.Scan(&userID, &roles, &firstname, &lastname, &avatarURL, &notification, &pin, &lastSeen) {
+	for mIter.Scan(&userID, &roles, &firstname, &lastname, &memberAvatar, &notification, &pin, &lastSeen) {
 		room.Members = append(room.Members, Member{
 			Id: userID, Roles: roles, FirstName: firstname,
-			LastName: lastname, AvatarUrl: avatarURL,
+			LastName: lastname, AvatarUrl: memberAvatar,
 			Notification: notification, Pin: pin, LastSeen: lastSeen,
 		})
 	}
-	mIter.Close()
+	_ = mIter.Close()
 
-	lIter := p.Session.Query(`SELECT message_id, content, message_type, username, client_id, created_at FROM room_last_message WHERE room_id = ?`, roomId).Iter()
 	var msgID, lcontent, ltype, lusername, lclientID string
 	var lcreatedAt time.Time
-	if lIter.Scan(&msgID, &lcontent, &ltype, &lusername, &lclientID, &lcreatedAt) {
+	if err := p.Session.Query(
+		`SELECT message_id, content, message_type, username, client_id, created_at FROM room_last_message WHERE room_id = ?`,
+		roomId,
+	).Scan(&msgID, &lcontent, &ltype, &lusername, &lclientID, &lcreatedAt); err == nil {
 		room.Message = Message{
 			ID: msgID, Content: lcontent, Type: ltype,
 			Username: lusername, ClientID: lclientID, CreatedAt: lcreatedAt,
 		}
 	}
-	lIter.Close()
 
 	return room
 }
@@ -245,8 +240,10 @@ func (p *ScyllaProvider) GetMessage(messageId string) Message {
 	var id, content, msgType, roomID, username, clientID, uniqid string
 	var createdAt, updatedAt time.Time
 
-	err := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages WHERE id = ?`,
-		messageId).Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt)
+	err := p.Session.Query(
+		`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages WHERE id = ?`,
+		messageId,
+	).Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt)
 	if err != nil {
 		return Message{}
 	}
@@ -260,23 +257,17 @@ func (p *ScyllaProvider) GetMessageById(id string) Message {
 }
 
 func (p *ScyllaProvider) GetMessageByUniqId(uniqId string) Message {
-	var id, content, msgType, roomID, username, clientID, uniqid string
-	var createdAt, updatedAt time.Time
-
-	err := p.Session.Query(`SELECT id, content, message_type, room_id, username, client_id, uniqid, created_at, updated_at FROM messages WHERE uniqid = ? ALLOW FILTERING`,
-		uniqId).Scan(&id, &content, &msgType, &roomID, &username, &clientID, &uniqid, &createdAt, &updatedAt)
-	if err != nil {
+	var id string
+	if err := p.Session.Query(`SELECT id FROM messages_by_uniqid WHERE uniqid = ?`, uniqId).Scan(&id); err != nil {
 		return Message{}
 	}
-
-	d, r := p.loadDeliverAndRead(id)
-	return mapMessageScylla(id, content, msgType, roomID, username, clientID, uniqid, createdAt, updatedAt, d, r)
+	return p.GetMessage(id)
 }
 
 func (p *ScyllaProvider) MessageDelivery(id string, clientIds []string) error {
-	b := p.Session.NewBatch(gocql.LoggedBatch)
+	// Only touch PK-addressable rows. Side-table is source of truth for receipts.
+	b := p.Session.NewBatch(gocql.UnloggedBatch)
 	b.Query(`UPDATE messages SET delivered = true WHERE id = ?`, id)
-	b.Query(`UPDATE messages_by_room SET delivered = true WHERE id = ?`, id)
 	for _, cid := range clientIds {
 		b.Query(`INSERT INTO message_deliver (message_id, client_id) VALUES (?, ?)`, id, cid)
 	}
@@ -284,9 +275,8 @@ func (p *ScyllaProvider) MessageDelivery(id string, clientIds []string) error {
 }
 
 func (p *ScyllaProvider) MessageRead(id string, clientIds []string) error {
-	b := p.Session.NewBatch(gocql.LoggedBatch)
+	b := p.Session.NewBatch(gocql.UnloggedBatch)
 	b.Query(`UPDATE messages SET read = true WHERE id = ?`, id)
-	b.Query(`UPDATE messages_by_room SET read = true WHERE id = ?`, id)
 	for _, cid := range clientIds {
 		b.Query(`INSERT INTO message_read (message_id, client_id) VALUES (?, ?)`, id, cid)
 	}
@@ -294,12 +284,12 @@ func (p *ScyllaProvider) MessageRead(id string, clientIds []string) error {
 }
 
 func (p *ScyllaProvider) UpdateRoomById(id string, room Room) {
-	p.Session.Query(`UPDATE rooms SET status = ?, updated_at = ? WHERE id = ?`, string(room.Status), time.Now(), id).Exec()
-
+	_ = p.Session.Query(
+		`UPDATE rooms SET status = ?, type = ?, avatar_url = ?, updated_at = ? WHERE id = ?`,
+		string(room.Status), string(room.Type), room.AvatarUrl, time.Now(), id,
+	).Exec()
 	for _, m := range room.Members {
-		p.Session.Query(`INSERT INTO room_members (room_id, user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, m.Id, m.Roles, m.FirstName, m.LastName, m.AvatarUrl, m.Notification, m.Pin, m.LastSeen,
-		).Exec()
+		p.upsertMember(id, m, room.Type)
 	}
 }
 
@@ -309,67 +299,77 @@ func (p *ScyllaProvider) GetById(roomId string) Room {
 	return p.GetRoom(roomId)
 }
 
+func (p *ScyllaProvider) userRoomIDs(userId string, onlyPin bool, filterType string) []string {
+	iter := p.Session.Query(
+		`SELECT room_id, pin, room_type FROM rooms_by_user WHERE user_id = ?`,
+		userId,
+	).Iter()
+	var roomID, roomType string
+	var pin bool
+	var ids []string
+	for iter.Scan(&roomID, &pin, &roomType) {
+		if onlyPin && !pin {
+			continue
+		}
+		if filterType != "" && roomType != filterType {
+			continue
+		}
+		ids = append(ids, roomID)
+	}
+	_ = iter.Close()
+	return ids
+}
+
 func (p *ScyllaProvider) GetMyRooms(userId string, page, offset int, filterType string) []Room {
 	limit := offset
-	skip := (page * offset) - offset
-
-	mIter := p.Session.Query(`SELECT room_id FROM room_members WHERE user_id = ? ALLOW FILTERING`, userId).Iter()
-	var roomID string
-	var allRooms []Room
-
-	for mIter.Scan(&roomID) {
-		room := p.GetRoom(roomID)
-		if room.ID == "" {
-			continue
-		}
-		if filterType != "" && string(room.Type) != filterType {
-			continue
-		}
-		allRooms = append(allRooms, room)
+	if limit <= 0 {
+		limit = 10
 	}
-	mIter.Close()
+	if page < 1 {
+		page = 1
+	}
+	skip := (page - 1) * limit
 
-	if skip > 0 && len(allRooms) > skip {
-		allRooms = allRooms[skip:]
-	} else if skip > 0 {
+	ids := p.userRoomIDs(userId, false, filterType)
+	if skip >= len(ids) {
 		return nil
 	}
-	if len(allRooms) > limit {
-		allRooms = allRooms[:limit]
+	end := skip + limit
+	if end > len(ids) {
+		end = len(ids)
 	}
-	return allRooms
+
+	var rooms []Room
+	for _, id := range ids[skip:end] {
+		if room := p.GetRoom(id); room.ID != "" {
+			rooms = append(rooms, room)
+		}
+	}
+	return rooms
 }
 
 func (p *ScyllaProvider) GetMyPinRooms(userId string) []Room {
-	iter := p.Session.Query(`SELECT room_id FROM room_members WHERE user_id = ? AND pin = true ALLOW FILTERING`, userId).Iter()
-	var roomID string
+	ids := p.userRoomIDs(userId, true, "")
 	var result []Room
-
-	for iter.Scan(&roomID) {
-		room := p.GetRoom(roomID)
-		if room.ID != "" {
+	for _, id := range ids {
+		if room := p.GetRoom(id); room.ID != "" {
 			result = append(result, room)
 			if len(result) >= 5 {
 				break
 			}
 		}
 	}
-	iter.Close()
 	return result
 }
 
 func (p *ScyllaProvider) GetOlineMyRooms(userId string) []Room {
-	iter := p.Session.Query(`SELECT room_id FROM room_members WHERE user_id = ? ALLOW FILTERING`, userId).Iter()
-	var roomID string
+	ids := p.userRoomIDs(userId, false, "")
 	var result []Room
-
-	for iter.Scan(&roomID) {
-		room := p.GetRoom(roomID)
-		if room.ID != "" {
+	for _, id := range ids {
+		if room := p.GetRoom(id); room.ID != "" {
 			result = append(result, room)
 		}
 	}
-	iter.Close()
 	return result
 }
 
@@ -378,22 +378,32 @@ func (p *ScyllaProvider) Insert(room Room) {
 }
 
 func (p *ScyllaProvider) LastMessage(id string, message Message) bool {
-	err := p.Session.Query(`INSERT INTO room_last_message (room_id, message_id, content, message_type, username, client_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	err := p.Session.Query(
+		`INSERT INTO room_last_message (room_id, message_id, content, message_type, username, client_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id, message.ID, message.Content, message.Type, message.Username, message.ClientID, message.CreatedAt,
 	).Exec()
 	return err == nil
 }
 
 func (p *ScyllaProvider) Update(room Room) {
-	p.Session.Query(`UPDATE rooms SET status = ?, updated_at = ? WHERE id = ?`, string(room.Status), time.Now(), room.ID).Exec()
+	_ = p.Session.Query(
+		`UPDATE rooms SET status = ?, updated_at = ? WHERE id = ?`,
+		string(room.Status), time.Now(), room.ID,
+	).Exec()
 }
 
 func (p *ScyllaProvider) UpdateMember(room Room) {
-	p.Session.Query(`DELETE FROM room_members WHERE room_id = ?`, room.ID).Exec()
+	// Drop old membership index rows, then rewrite.
+	old := p.Session.Query(`SELECT user_id FROM room_members WHERE room_id = ?`, room.ID).Iter()
+	var oldUID string
+	for old.Scan(&oldUID) {
+		_ = p.Session.Query(`DELETE FROM rooms_by_user WHERE user_id = ? AND room_id = ?`, oldUID, room.ID).Exec()
+	}
+	_ = old.Close()
+	_ = p.Session.Query(`DELETE FROM room_members WHERE room_id = ?`, room.ID).Exec()
+
 	for _, m := range room.Members {
-		p.Session.Query(`INSERT INTO room_members (room_id, user_id, roles, firstname, lastname, avatar_url, notification, pin, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			room.ID, m.Id, m.Roles, m.FirstName, m.LastName, m.AvatarUrl, m.Notification, m.Pin, m.LastSeen,
-		).Exec()
+		p.upsertMember(room.ID, m, room.Type)
 	}
 }
 
@@ -409,10 +419,13 @@ func (p *ScyllaProvider) UpdateRoom(room Room) error {
 		setClauses += ", avatar_url = ?"
 		args = append(args, room.AvatarUrl)
 	}
+	if room.Type != "" {
+		setClauses += ", type = ?"
+		args = append(args, string(room.Type))
+	}
 
 	args = append(args, room.ID)
-	err := p.Session.Query("UPDATE rooms SET "+setClauses+" WHERE id = ?", args...).Exec()
-	if err != nil {
+	if err := p.Session.Query("UPDATE rooms SET "+setClauses+" WHERE id = ?", args...).Exec(); err != nil {
 		return err
 	}
 
@@ -423,70 +436,79 @@ func (p *ScyllaProvider) UpdateRoom(room Room) error {
 }
 
 func (p *ScyllaProvider) UpdateRoomAvatar(roomId, avatarUrl string) error {
-	return p.Session.Query(`UPDATE rooms SET avatar_url = ?, updated_at = ? WHERE id = ?`, avatarUrl, time.Now(), roomId).Exec()
+	return p.Session.Query(
+		`UPDATE rooms SET avatar_url = ?, updated_at = ? WHERE id = ?`,
+		avatarUrl, time.Now(), roomId,
+	).Exec()
 }
 
 // --- UserOps ---
 
 func (p *ScyllaProvider) GetUser(userId string) Member {
 	var member Member
-	uid, err := strconv.Atoi(userId)
-	if err != nil {
+	if userId == "" {
 		return member
 	}
 
 	var firstname, lastname, username, avatarUrl string
 	var lastSeen int64
+	var uid string
 
-	err = p.Session.Query(`SELECT user_id, firstname, lastname, username, avatar_url, last_seen FROM users WHERE user_id = ?`,
-		uid).Scan(&uid, &firstname, &lastname, &username, &avatarUrl, &lastSeen)
+	err := p.Session.Query(
+		`SELECT user_id, firstname, lastname, username, avatar_url, last_seen FROM users WHERE user_id = ?`,
+		userId,
+	).Scan(&uid, &firstname, &lastname, &username, &avatarUrl, &lastSeen)
 	if err != nil {
 		return member
 	}
 
-	member.Id = userId
+	member.Id = uid
 	member.FirstName = firstname
 	member.LastName = lastname
+	member.AvatarUrl = avatarUrl
 	member.LastSeen = lastSeen
 	return member
 }
 
 func (p *ScyllaProvider) UpdateUser(userId string, user UserDto) {
-	uid, _ := strconv.Atoi(userId)
-	p.Session.Query(`UPDATE users SET firstname = ?, lastname = ?, username = ?, avatar_url = ? WHERE user_id = ?`,
-		user.FirstName, user.LastName, user.UserName, user.AvatarUrl, uid).Exec()
+	if userId == "" {
+		return
+	}
+	_ = p.Session.Query(
+		`UPDATE users SET firstname = ?, lastname = ?, username = ?, avatar_url = ? WHERE user_id = ?`,
+		user.FirstName, user.LastName, user.UserName, user.AvatarUrl, userId,
+	).Exec()
 }
 
 func (p *ScyllaProvider) EnsureUser(member Member) {
-	uid, err := strconv.Atoi(member.Id)
-	if err != nil {
+	if member.Id == "" {
 		return
 	}
-
-	var count int
-	p.Session.Query(`SELECT COUNT(*) FROM users WHERE user_id = ?`, uid).Scan(&count)
-	if count > 0 {
+	// Lightweight existence check via PK read (no COUNT aggregate).
+	var uid string
+	err := p.Session.Query(`SELECT user_id FROM users WHERE user_id = ?`, member.Id).Scan(&uid)
+	if err == nil {
 		return
 	}
-
-	p.Session.Query(`INSERT INTO users (user_id, firstname, lastname, avatar_url) VALUES (?, ?, ?, ?)`,
-		uid, member.FirstName, member.LastName, member.AvatarUrl).Exec()
+	_ = p.Session.Query(
+		`INSERT INTO users (user_id, firstname, lastname, avatar_url) VALUES (?, ?, ?, ?)`,
+		member.Id, member.FirstName, member.LastName, member.AvatarUrl,
+	).Exec()
 }
 
 func (p *ScyllaProvider) UpdateLastSeen(userId string, lastSeen int64) {
-	uid, _ := strconv.Atoi(userId)
-	p.Session.Query(`UPDATE users SET last_seen = ? WHERE user_id = ?`, lastSeen, uid).Exec()
+	if userId == "" {
+		return
+	}
+	_ = p.Session.Query(`UPDATE users SET last_seen = ? WHERE user_id = ?`, lastSeen, userId).Exec()
 }
 
 func (p *ScyllaProvider) GetUserLastSeen(userId string) int64 {
-	uid, err := strconv.Atoi(userId)
-	if err != nil {
+	if userId == "" {
 		return 0
 	}
-
 	var lastSeen int64
-	err = p.Session.Query(`SELECT last_seen FROM users WHERE user_id = ?`, uid).Scan(&lastSeen)
-	if err != nil {
+	if err := p.Session.Query(`SELECT last_seen FROM users WHERE user_id = ?`, userId).Scan(&lastSeen); err != nil {
 		return 0
 	}
 	return lastSeen
