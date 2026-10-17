@@ -7,8 +7,9 @@
 # web (React)
 web/node_modules
 web/dist
+uploads/
 
-
+graphify-out/
 # test/profile binaries
 ws.test
 *.prof
