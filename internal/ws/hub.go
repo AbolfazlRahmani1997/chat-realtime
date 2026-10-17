@@ -113,6 +113,12 @@ type Hub struct {
 	Unregister           chan *Client
 	Broadcast            chan *Message
 	Room                 chan *Room
+	persistCh            chan persistJob
+	roomWatchers         map[string]map[string]struct{}
+	userRooms            map[string]map[string]struct{}
+	shardRooms           map[int]int
+	workerOnce           sync.Once
+	liveConns            atomic.Uint64
 	MessageService       MessageService
 	RoomService          RoomService
 	RoomBroker           RoomBrokerInfrastructure
@@ -195,13 +201,9 @@ func NewHub(client *mongo.Client, redisClient *redis.Client, db DatabaseProvider
 }
 
 func (h *Hub) Run() {
-	for i := 0; i < hubBroadcastWorkers; i++ {
-		go h.broadcastWorker()
-	}
+	h.ensureScaleWorkers()
 	for {
 		select {
-		case messageId := <-h.ReadAble:
-			go h.handleReadReceipt(messageId)
 		case room := <-h.Room:
 			h.handleRoomCreated(room)
 		case cl := <-h.Register:
@@ -269,6 +271,102 @@ func (h *Hub) handleReadReceipt(messageId *ReadMessage) {
 	}
 }
 
+// fanoutReaction pushes the current reaction set to everyone joined in the room.
+func (h *Hub) fanoutReaction(roomID, messageID string, reactions []Reaction) {
+	if roomID == "" || messageID == "" {
+		return
+	}
+	if reactions == nil {
+		reactions = []Reaction{}
+	}
+	payload := map[string]interface{}{
+		"event_type": "messageReaction",
+		"room_id":    roomID,
+		"content": map[string]interface{}{
+			"message_id": messageID,
+			"reactions":  reactions,
+		},
+	}
+	snap, ok := h.snapshotRoomForBroadcast(roomID)
+	if !ok {
+		return
+	}
+	for _, cl := range snap.clients {
+		if cl != nil {
+			cl.writeJSONAll(payload)
+		}
+	}
+}
+
+// fanoutEdit tells everyone in the room that a message text changed.
+func (h *Hub) fanoutEdit(roomID, messageID, content string) {
+	if roomID == "" || messageID == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"event_type": "messageEdited",
+		"room_id":    roomID,
+		"content": map[string]interface{}{
+			"message_id": messageID,
+			"content":    content,
+			"edited":     true,
+		},
+	}
+	snap, ok := h.snapshotRoomForBroadcast(roomID)
+	if !ok {
+		return
+	}
+	for _, cl := range snap.clients {
+		if cl != nil {
+			cl.writeJSONAll(payload)
+		}
+	}
+}
+
+// fanoutSecret tells the room that a secret was opened or wiped. It never includes the text.
+func (h *Hub) fanoutSecret(roomID, eventType, messageID, userID string) {
+	if roomID == "" || messageID == "" || eventType == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"event_type": eventType,
+		"room_id":    roomID,
+		"content": map[string]string{
+			"message_id": messageID,
+			"user_id":    userID,
+		},
+	}
+	snap, ok := h.snapshotRoomForBroadcast(roomID)
+	if !ok {
+		return
+	}
+	for _, cl := range snap.clients {
+		if cl != nil {
+			cl.writeJSONAll(payload)
+		}
+	}
+}
+
+// notifyDelivered tells the author that another member now has the message.
+// Content is an object so clients can tell it apart from the send ack, which uses a string ulid.
+func (h *Hub) notifyDelivered(authorID, messageID, roomID, userID string) {
+	if authorID == "" || messageID == "" || authorID == userID {
+		return
+	}
+	user, ok := h.getUserLocked(authorID)
+	if !ok || user == nil {
+		return
+	}
+	user.dispatch(&SystemMessage{
+		EventType: deliverMessage,
+		Content: map[string]string{
+			"message_id": messageID,
+			"room_id":    roomID,
+			"user_id":    userID,
+		},
+	})
+}
+
 func (h *Hub) handleRoomCreated(room *Room) {
 	if room == nil || room.ID == "" {
 		return
@@ -334,7 +432,7 @@ func (h *Hub) handleRoomCreated(room *Room) {
 		if h.Ntfy != nil && isNew {
 			for _, member := range members {
 				if member.Id != "" {
-					go h.Ntfy.NotifyNewRoom(member.Id, roomName)
+					h.Ntfy.NotifyNewRoom(member.Id, roomName)
 				}
 			}
 		}
@@ -456,8 +554,9 @@ func (h *Hub) handleBroadcast(m *Message) {
 
 	snap, ok := h.snapshotRoomForBroadcast(m.RoomID)
 	if !ok {
-		// Cross-instance: room may not be cached here, but local Users still need incomeMessage.
-		if isRemote {
+		// A remote message is only worth a DB read when a local user watches the room.
+		// Otherwise every pod would query Mongo for every message in the cluster.
+		if isRemote && h.hasRoomWatchers(m.RoomID) {
 			snap, ok = h.snapshotMembersFromDB(m.RoomID)
 		}
 		if !ok {
@@ -471,48 +570,14 @@ func (h *Hub) handleBroadcast(m *Message) {
 		if m.ID == "" {
 			m.ID = m.UniqId
 		}
-
-		if h.KafkaProducer != nil {
-			payload := &messagebroker.MessagePayload{
-				ID:        m.ID,
-				Content:   m.Content,
-				Type:      m.Type,
-				UniqId:    m.UniqId,
-				RoomID:    m.RoomID,
-				Username:  m.Username,
-				ClientID:  m.ClientID,
-				Deliver:   m.Deliver,
-				Read:      m.Read,
-				CreatedAt: m.CreatedAt,
-				UpdatedAt: m.UpdatedAt,
-			}
-			if m.ReplyTo != nil {
-				b, _ := json.Marshal(m.ReplyTo)
-				var ri messagebroker.ReplyInfo
-				_ = json.Unmarshal(b, &ri)
-				payload.ReplyTo = &ri
-			}
-			if m.ForwardFrom != nil {
-				b, _ := json.Marshal(m.ForwardFrom)
-				var fi messagebroker.ForwardInfo
-				_ = json.Unmarshal(b, &fi)
-				payload.ForwardFrom = &fi
-			}
-			if err := h.KafkaProducer.PublishMessage(payload); err != nil {
-				log.Printf("kafka publish failed, falling back to direct DB write: %v", err)
-				if h.DB != nil {
-					h.DB.MessageOps().InsertMessage(*m)
+		if m.Type == MessageContentTypeSecret && h.DB != nil {
+			audience := make([]string, 0, len(snap.members))
+			for _, member := range snap.members {
+				if member.Id != "" {
+					audience = append(audience, member.Id)
 				}
 			}
-		} else if h.DB != nil {
-			h.DB.MessageOps().InsertMessage(*m)
-		}
-
-		if h.DB != nil {
-			h.RoomService.UpdateLastMessage(Room{ID: snap.roomID}, *m)
-		}
-		if h.RedisBroker != nil {
-			h.RedisBroker.PublishMessage(m.RoomID, m)
+			_ = h.DB.MessageOps().SaveSecretAudience(m.ID, audience)
 		}
 	}
 
@@ -530,6 +595,10 @@ func (h *Hub) handleBroadcast(m *Message) {
 	out.Deliver = nil
 	out.Read = nil
 	out.cachedRoomJSON = nil
+	if out.Type == MessageContentTypeSecret {
+		out.Content = ""
+		out.SecretState = SecretLocked
+	}
 	needUnifiedJSON := false
 	for _, cl := range snap.clients {
 		if cl != nil && cl.UnifiedConn {
@@ -561,12 +630,16 @@ func (h *Hub) handleBroadcast(m *Message) {
 	}
 	h.mx.RUnlock()
 	for _, user := range pupUsers {
+		body := m.Content
+		if m.Type == MessageContentTypeSecret {
+			body = ""
+		}
 		user.trySendPupMessage(&PupMessage{
 			MessageId: m.ID,
 			RoomId:    m.RoomID,
 			Firstname: firstname,
 			Lastname:  lastname,
-			Content:   m.Content,
+			Content:   body,
 			Type:      m.Type,
 		})
 	}
@@ -582,11 +655,15 @@ func (h *Hub) handleBroadcast(m *Message) {
 		if senderName == "" {
 			senderName = "کاربر"
 		}
+		notifyBody := m.Content
+		if m.Type == MessageContentTypeSecret {
+			notifyBody = "پیام محرمانه"
+		}
 		for _, member := range snap.members {
 			if member.Id == m.ClientID || snap.hasClient(member.Id) {
 				continue
 			}
-			go h.Ntfy.NotifyNewMessage(member.Id, senderName, m.Content, m.RoomID, m.Type, "")
+			h.Ntfy.NotifyNewMessage(member.Id, senderName, notifyBody, m.RoomID, m.Type, "")
 		}
 	}
 
@@ -600,9 +677,18 @@ func (h *Hub) handleBroadcast(m *Message) {
 		}
 		cl.trySendMessage(outPtr)
 	}
-	if !isRemote && len(deliverIDs) > 0 && h.DB != nil {
-		deliver := append([]string(nil), deliverIDs...)
-		_ = h.DB.MessageOps().MessageDelivery(m.ID, deliver)
+	msgKey := m.UniqId
+	if msgKey == "" {
+		msgKey = m.ID
+	}
+	for _, id := range deliverIDs {
+		h.notifyDelivered(m.ClientID, msgKey, m.RoomID, id)
+	}
+	if !isRemote {
+		stored := *m
+		stored.cachedRoomJSON = nil
+		stored.Deliver = deliverIDs
+		h.enqueuePersist(stored)
 	}
 }
 
@@ -688,6 +774,8 @@ func (h *Hub) Manager() {
 			h.mx.Unlock()
 		case uc, _ := <-h.Left:
 			h.mx.Lock()
+			var unsub []string
+			var broker *RedisPubSubBroker
 			u, exists := h.Users[uc.Userid]
 			if exists && u != nil {
 				u.mx.Lock()
@@ -698,6 +786,8 @@ func (h *Hub) Manager() {
 					h.PresenceManager.RemoveUserConnection(uc.Userid, uc.ConnectionId)
 				}
 				if empty {
+					unsub = h.dropUserWatchersLocked(uc.Userid)
+					broker = h.RedisBroker
 					now := time.Now().Unix()
 					delete(h.Users, uc.Userid)
 					u.shutdown()
@@ -711,6 +801,9 @@ func (h *Hub) Manager() {
 				}
 			}
 			h.mx.Unlock()
+			if broker != nil {
+				broker.UnsubscribeMessages(unsub)
+			}
 
 		case user, _ := <-h.Evade:
 			go h.OnlineMessage(user.UserId, evade)
@@ -724,6 +817,16 @@ func (h *Hub) OnlineMessage(userId string, status status) {
 	}
 	rooms := h.DB.RoomOps().GetOlineMyRooms(userId)
 	for _, room := range rooms {
+		watched := h.watchersExcept(room.ID, userId)
+		if len(watched) > 0 {
+			for _, user := range watched {
+				user.trySendRoomStatus(&RoomStatus{RoomId: room.ID, Status: status})
+			}
+			continue
+		}
+		if h.hasRoomWatchers(room.ID) {
+			continue
+		}
 		for _, client := range room.Members {
 			if client.Id == userId {
 				continue
@@ -740,6 +843,64 @@ func (h *Hub) OnlineMessage(userId string, status status) {
 		} else if status == offline {
 			h.PresenceManager.BroadcastUserOffline(userId, rooms)
 		}
+	}
+}
+
+func (h *Hub) persistMessage(m Message) {
+	if h.KafkaProducer != nil {
+		payload := &messagebroker.MessagePayload{
+			ID:        m.ID,
+			Content:   m.Content,
+			Type:      m.Type,
+			UniqId:    m.UniqId,
+			RoomID:    m.RoomID,
+			Username:  m.Username,
+			ClientID:  m.ClientID,
+			Deliver:   m.Deliver,
+			Read:      m.Read,
+			CreatedAt: m.CreatedAt,
+			UpdatedAt: m.UpdatedAt,
+		}
+		if m.ReplyTo != nil {
+			b, _ := json.Marshal(m.ReplyTo)
+			var ri messagebroker.ReplyInfo
+			_ = json.Unmarshal(b, &ri)
+			payload.ReplyTo = &ri
+		}
+		if m.ForwardFrom != nil {
+			b, _ := json.Marshal(m.ForwardFrom)
+			var fi messagebroker.ForwardInfo
+			_ = json.Unmarshal(b, &fi)
+			payload.ForwardFrom = &fi
+		}
+		if err := h.KafkaProducer.PublishMessage(payload); err != nil {
+			log.Printf("kafka publish failed, falling back to direct DB write: %v", err)
+			if h.DB != nil {
+				h.DB.MessageOps().InsertMessage(m)
+			}
+		}
+	} else if h.DB != nil {
+		h.DB.MessageOps().InsertMessage(m)
+	}
+
+	if h.DB != nil {
+		last := m
+		if last.Type == MessageContentTypeSecret {
+			last.Content = ""
+			last.SecretState = SecretLocked
+		}
+		h.RoomService.UpdateLastMessage(Room{ID: m.RoomID}, last)
+		if len(m.Deliver) > 0 {
+			_ = h.DB.MessageOps().MessageDelivery(m.ID, m.Deliver)
+		}
+	}
+	if h.RedisBroker != nil {
+		pub := m
+		if pub.Type == MessageContentTypeSecret {
+			pub.Content = ""
+			pub.SecretState = SecretLocked
+		}
+		h.RedisBroker.PublishMessage(m.RoomID, &pub)
 	}
 }
 

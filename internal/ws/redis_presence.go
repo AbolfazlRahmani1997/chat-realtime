@@ -5,18 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	RedisKeyPresence     = "chat:presence"
-	RedisKeyActiveRooms  = "chat:active_rooms"
-	RedisKeyRoomClients  = "chat:room:%s:clients"
-	RedisKeyUserRooms    = "chat:user:%s:rooms"
-	RedisKeyInstanceUser = "chat:instance:%s:users"
+	RedisKeyPresence       = "chat:presence"
+	RedisKeyPresenceCounts = "chat:presence:counts"
+	RedisKeyOnlineUser     = "chat:online:%s"
+	RedisKeyActiveRooms    = "chat:active_rooms"
+	RedisKeyRoomClients    = "chat:room:%s:clients"
+	RedisKeyUserRooms      = "chat:user:%s:rooms"
+	RedisKeyInstanceUser   = "chat:instance:%s:users"
 
 	PresenceTTL = 2 * time.Minute
 )
@@ -38,15 +39,10 @@ type RedisPresenceManager struct {
 }
 
 func NewRedisPresenceManager(hub *Hub, broker *RedisPubSubBroker, client *redis.Client) *RedisPresenceManager {
-	instanceID := fmt.Sprintf("instance-%d", time.Now().UnixNano())
-	if hostname, err := os.Hostname(); err == nil {
-		instanceID = hostname
-	}
-
 	return &RedisPresenceManager{
 		client:     client,
 		ctx:        context.Background(),
-		instanceID: instanceID,
+		instanceID: instanceIdentity(),
 		hub:        hub,
 		broker:     broker,
 	}
@@ -65,6 +61,8 @@ func (p *RedisPresenceManager) AddUserConnection(userID string, connectionID str
 	pipe := p.client.Pipeline()
 	pipe.HSet(p.ctx, RedisKeyPresence, fmt.Sprintf("%s:%s", userID, connectionID), string(data))
 	pipe.Expire(p.ctx, RedisKeyPresence, PresenceTTL*10)
+	pipe.HIncrBy(p.ctx, RedisKeyPresenceCounts, userID, 1)
+	pipe.Set(p.ctx, fmt.Sprintf(RedisKeyOnlineUser, userID), "1", PresenceTTL)
 	pipe.SAdd(p.ctx, fmt.Sprintf(RedisKeyInstanceUser, p.instanceID), userID)
 	pipe.Expire(p.ctx, fmt.Sprintf(RedisKeyInstanceUser, p.instanceID), PresenceTTL*10)
 	_, err := pipe.Exec(p.ctx)
@@ -76,60 +74,44 @@ func (p *RedisPresenceManager) AddUserConnection(userID string, connectionID str
 func (p *RedisPresenceManager) RemoveUserConnection(userID string, connectionID string) {
 	pipe := p.client.Pipeline()
 	pipe.HDel(p.ctx, RedisKeyPresence, fmt.Sprintf("%s:%s", userID, connectionID))
-
-	count, _ := p.client.HLen(p.ctx, RedisKeyPresence).Result()
-	if count == 0 {
+	n, err := p.client.HIncrBy(p.ctx, RedisKeyPresenceCounts, userID, -1).Result()
+	if err != nil {
+		log.Printf("redis presence: failed to decrement user connection: %v", err)
+	}
+	if n <= 0 {
+		pipe.HDel(p.ctx, RedisKeyPresenceCounts, userID)
+		pipe.Del(p.ctx, fmt.Sprintf(RedisKeyOnlineUser, userID))
 		pipe.SRem(p.ctx, fmt.Sprintf(RedisKeyInstanceUser, p.instanceID), userID)
 	}
-	_, err := pipe.Exec(p.ctx)
+	_, err = pipe.Exec(p.ctx)
 	if err != nil {
 		log.Printf("redis presence: failed to remove user connection: %v", err)
 	}
 }
 
 func (p *RedisPresenceManager) IsUserOnline(userID string) bool {
-	keys, err := p.client.HKeys(p.ctx, RedisKeyPresence).Result()
-	if err != nil {
-		return false
-	}
-	for _, key := range keys {
-		var entry PresenceEntry
-		val, _ := p.client.HGet(p.ctx, RedisKeyPresence, key).Result()
-		if err := json.Unmarshal([]byte(val), &entry); err == nil && entry.UserID == userID {
-			return true
-		}
-	}
-	return false
+	n, err := p.client.Exists(p.ctx, fmt.Sprintf(RedisKeyOnlineUser, userID)).Result()
+	return err == nil && n == 1
 }
 
 func (p *RedisPresenceManager) BroadcastUserOnline(userID string, rooms []Room) {
 	for _, room := range rooms {
-		for _, member := range room.Members {
-			if member.Id == userID {
-				continue
-			}
-			p.broker.PublishRoomEvent(&PubSubRoomEvent{
-				Type:   "user_online",
-				RoomID: room.ID,
-				UserID: userID,
-				Status: "online",
-			})
-		}
+		p.broker.PublishRoomEvent(&PubSubRoomEvent{
+			Type:   "user_online",
+			RoomID: room.ID,
+			UserID: userID,
+			Status: "online",
+		})
 	}
 }
 
 func (p *RedisPresenceManager) BroadcastUserOffline(userID string, rooms []Room) {
 	for _, room := range rooms {
-		for _, member := range room.Members {
-			if member.Id == userID {
-				continue
-			}
-			p.broker.PublishRoomEvent(&PubSubRoomEvent{
-				Type:   "user_offline",
-				RoomID: room.ID,
-				UserID: userID,
-				Status: "offline",
-			})
-		}
+		p.broker.PublishRoomEvent(&PubSubRoomEvent{
+			Type:   "user_offline",
+			RoomID: room.ID,
+			UserID: userID,
+			Status: "offline",
+		})
 	}
 }

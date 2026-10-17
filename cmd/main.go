@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 	"server/adapters/Reporisotires"
 	"server/adapters/Services"
 	"server/internal/admin"
@@ -13,6 +12,7 @@ import (
 	"server/internal/ws"
 	"server/ports/reporisoties"
 	"server/router"
+	"time"
 
 	"github.com/gocql/gocql"
 	"github.com/joho/godotenv"
@@ -56,9 +56,11 @@ func initRedis() *redis.Client {
 	}
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 	client := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPassword,
-		DB:       0,
+		Addr:         redisAddr,
+		Password:     redisPassword,
+		DB:           0,
+		PoolSize:     64,
+		MinIdleConns: 8,
 	})
 	if _, err := client.Ping(context.TODO()).Result(); err != nil {
 		log.Printf("redis connect warning: %v (chat will run without Redis clustering)", err)

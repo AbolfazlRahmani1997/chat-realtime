@@ -190,6 +190,31 @@ func EnsureSchema(session *gocql.Session, keyspace string) {
 			PRIMARY KEY (message_id, client_id)
 		)`, keyspace),
 
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.message_reactions (
+			message_id text,
+			user_id text,
+			emoji text,
+			room_id text,
+			PRIMARY KEY (message_id, user_id)
+		)`, keyspace),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.message_meta (
+			message_id text PRIMARY KEY,
+			forward_from text,
+			edited boolean
+		)`, keyspace),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.message_secrets (
+			message_id text PRIMARY KEY,
+			audience set<text>
+		)`, keyspace),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.message_secret_views (
+			message_id text,
+			user_id text,
+			PRIMARY KEY (message_id, user_id)
+		)`, keyspace),
+
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.rooms (
 			id text PRIMARY KEY,
 			name text,

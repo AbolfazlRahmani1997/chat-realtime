@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"reflect"
@@ -18,6 +18,17 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/oklog/ulid/v2"
 )
+
+var gatewayClient = &http.Client{
+	Timeout: 3 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 256,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+const gatewayUserTTL = 5 * time.Minute
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -328,7 +339,7 @@ func (Handler *Handler) JoinRoom(c *gin.Context) {
 	Handler.hub.Register <- cl
 
 	go cl.writeMessage()
-	messagesRoom := Handler.hub.DB.MessageOps().GetRoomMessage(roomID, page)
+	messagesRoom := Handler.hub.DB.MessageOps().RedactSecrets(Handler.hub.DB.MessageOps().GetRoomMessage(roomID, page), clientID)
 	err = conn.WriteJSON(messagesRoom)
 	if err != nil {
 		return
@@ -361,6 +372,7 @@ func (Handler *Handler) GetRooms(c *gin.Context) {
 	}
 	userId := strconv.Itoa(userAuthed.Id)
 	room := Handler.hub.RoomService.GetMyRoom(userId, "1", "")
+	Handler.hub.NoteRoomWatchers(userId, roomIDsFromResponses(room))
 	if len(room) == 0 {
 		emptyArray := []string{}
 		err := conn.WriteJSON(emptyArray)
@@ -414,8 +426,13 @@ func (h *Handler) UnifiedWS(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errAuth.Error()})
 		return
 	}
+	if !h.hub.acquireConn() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "server at capacity"})
+		return
+	}
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
+		h.hub.releaseConn()
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -426,11 +443,13 @@ func (h *Handler) UnifiedWS(c *gin.Context) {
 	h.hub.AddUnifiedConnection <- &AddConnectionRequest{UserId: userId, ConnectionId: connectionId, Conn: wrapped}
 
 	rooms := h.hub.RoomService.GetMyRoom(userId, "1", "")
+	h.hub.NoteRoomWatchers(userId, roomIDsFromResponses(rooms))
 	if errW := wrapped.WriteJSON(map[string]interface{}{
 		"event_type":      "init",
 		"content":         rooms,
 		"current_user_id": userId,
 	}); errW != nil {
+		h.hub.releaseConn()
 		conn.Close()
 		return
 	}
@@ -440,6 +459,7 @@ func (h *Handler) UnifiedWS(c *gin.Context) {
 
 func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, connectionId string, userId string, username string) {
 	defer func() {
+		h.hub.releaseConn()
 		_ = rawConn.Close()
 		for _, cl := range h.hub.CollectUnifiedClientsForConn(userId, connectionId) {
 			select {
@@ -465,6 +485,7 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 				page = "1"
 			}
 			rooms := h.hub.RoomService.GetMyRoom(userId, page, incoming.Content)
+			h.hub.NoteRoomWatchers(userId, roomIDsFromResponses(rooms))
 			_ = writeConn.WriteJSON(SystemMessage{EventType: listRooms, Content: rooms})
 		case "seenMessage":
 			msgId := incoming.Item
@@ -487,11 +508,9 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 					_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny"})
 					continue
 				}
-			} else {
-				if !canWrite(userId, room.Members) {
-					_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny"})
-					continue
-				}
+			} else if !isMember(userId, room.Members) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny"})
+				continue
 			}
 			go h.hub.RoomService.SyncUser(room)
 			h.hub.EnsureRoom(room)
@@ -512,13 +531,18 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 			if page == "" {
 				page = "1"
 			}
-			messagesRoom := h.hub.DB.MessageOps().GetRoomMessage(roomID, page)
-			_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "roomHistory", "room_id": roomID, "content": messagesRoom})
+			messagesRoom := h.hub.DB.MessageOps().RedactSecrets(h.hub.DB.MessageOps().GetRoomMessage(roomID, page), userId)
+			_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "roomHistory", "room_id": roomID, "page": page, "content": messagesRoom})
 
 			messages := h.hub.DB.MessageOps().GetMessageNotDelivery(roomID, userId)
 			for i := range messages {
 				messages[i].Deliver = append(messages[i].Deliver, userId)
 				_ = h.hub.DB.MessageOps().MessageDelivery(messages[i].ID, messages[i].Deliver)
+				key := messages[i].UniqId
+				if key == "" {
+					key = messages[i].ID
+				}
+				h.hub.notifyDelivered(messages[i].ClientID, key, roomID, userId)
 			}
 		case "leaveRoom":
 			roomID := incoming.RoomID
@@ -554,9 +578,18 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 				continue
 			}
 
+			msgType := normalizeMessageContentType(incoming.Type)
+			if msgType == MessageContentTypeFile {
+				normalized, ok := normalizeFileMessage(content)
+				if !ok {
+					_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "invalid file", "room_id": roomID})
+					continue
+				}
+				content = normalized
+			}
 			msg := &Message{
 				Content:  content,
-				Type:     normalizeMessageContentType(incoming.Type),
+				Type:     msgType,
 				UniqId:   ulidVal,
 				RoomID:   roomID,
 				Username: username,
@@ -587,13 +620,18 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "message not found"})
 				continue
 			}
+			if original.Type == MessageContentTypeSecret {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "secret messages cannot be forwarded"})
+				continue
+			}
+			source := h.hub.DB.MessageOps().GetRoom(sourceRoomID)
+			target := h.hub.DB.RoomOps().GetById(targetRoomID)
+			if source.ID == "" || target.ID == "" || !isMember(userId, source.Members) || !isMember(userId, target.Members) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny"})
+				continue
+			}
 			if !h.hub.RoomExists(targetRoomID) {
-				targetRoom := h.hub.DB.RoomOps().GetById(targetRoomID)
-				if targetRoom.ID == "" {
-					_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "target room not found"})
-					continue
-				}
-				h.hub.EnsureRoom(targetRoom)
+				h.hub.EnsureRoom(target)
 			}
 			fwdMsg := &Message{
 				Content:  original.Content,
@@ -611,8 +649,157 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 			}
 			h.hub.EnqueueBroadcast(fwdMsg)
 			_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "deliverMessage", "Content": fwdMsg.UniqId, "room_id": targetRoomID})
+		case "editMessage":
+			roomID := incoming.RoomID
+			messageID := incoming.MessageID
+			if messageID == "" {
+				messageID = incoming.Ulid
+			}
+			content := strings.TrimSpace(incoming.Content)
+			if roomID == "" || messageID == "" || content == "" || len(content) > 4000 {
+				continue
+			}
+			msg := h.hub.DB.MessageOps().GetMessageByUniqId(messageID)
+			if msg.ID == "" {
+				msg = h.hub.DB.MessageOps().GetMessageById(messageID)
+			}
+			if msg.ID == "" || (msg.RoomID != "" && msg.RoomID != roomID) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "message not found", "room_id": roomID})
+				continue
+			}
+			if msg.ClientID != userId || (msg.Type != "" && msg.Type != "text") || msg.Type == MessageContentTypeSecret {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny", "room_id": roomID})
+				continue
+			}
+			edited, err := h.hub.DB.MessageOps().EditMessage(msg.ID, content)
+			if err != nil || edited.ID == "" {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "edit failed", "room_id": roomID})
+				continue
+			}
+			key := edited.UniqId
+			if key == "" {
+				key = edited.ID
+			}
+			h.hub.fanoutEdit(roomID, key, edited.Content)
+			if h.hub.RedisBroker != nil {
+				h.hub.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
+					Type:      "message_edited",
+					RoomID:    roomID,
+					MessageID: key,
+					Body:      edited.Content,
+				})
+			}
+		case "viewSecret":
+			roomID := incoming.RoomID
+			messageID := incoming.MessageID
+			if messageID == "" {
+				messageID = incoming.Ulid
+			}
+			if roomID == "" || messageID == "" {
+				continue
+			}
+			msg := h.hub.DB.MessageOps().GetMessageByUniqId(messageID)
+			if msg.ID == "" {
+				msg = h.hub.DB.MessageOps().GetMessageById(messageID)
+			}
+			if msg.ID == "" || (msg.RoomID != "" && msg.RoomID != roomID) || msg.Type != MessageContentTypeSecret {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "message not found", "room_id": roomID})
+				continue
+			}
+			content, state, purgedNow, err := h.hub.DB.MessageOps().ViewSecret(msg.ID, userId)
+			key := msg.UniqId
+			if key == "" {
+				key = msg.ID
+			}
+			if err != nil {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny", "room_id": roomID})
+				continue
+			}
+			switch state {
+			case SecretPurged:
+				h.hub.fanoutSecret(roomID, "secretPurged", key, userId)
+			case SecretViewed:
+				_ = writeConn.WriteJSON(map[string]interface{}{
+					"event_type": "secretViewed",
+					"room_id":    roomID,
+					"content": map[string]string{
+						"message_id": key,
+						"user_id":    userId,
+					},
+				})
+			default:
+				_ = writeConn.WriteJSON(map[string]interface{}{
+					"event_type": "secretBody",
+					"room_id":    roomID,
+					"content": map[string]string{
+						"message_id": key,
+						"content":    content,
+					},
+				})
+				h.hub.fanoutSecret(roomID, "secretViewed", key, userId)
+				if h.hub.RedisBroker != nil {
+					h.hub.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
+						Type:      "secret_viewed",
+						RoomID:    roomID,
+						MessageID: key,
+						UserID:    userId,
+					})
+				}
+				if purgedNow {
+					h.hub.fanoutSecret(roomID, "secretPurged", key, userId)
+					if h.hub.RedisBroker != nil {
+						h.hub.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
+							Type:      "secret_purged",
+							RoomID:    roomID,
+							MessageID: key,
+							UserID:    userId,
+						})
+					}
+				}
+			}
 		case "ping":
 			_ = writeConn.WriteJSON(SystemMessage{EventType: deliverMessage, Content: "ping"})
+		case "reactMessage":
+			roomID := incoming.RoomID
+			messageID := incoming.MessageID
+			if messageID == "" {
+				messageID = incoming.Ulid
+			}
+			emoji := strings.TrimSpace(incoming.Content)
+			if roomID == "" || messageID == "" || (emoji != "" && !allowedReaction(emoji)) {
+				continue
+			}
+			room := h.hub.DB.MessageOps().GetRoom(roomID)
+			if room.ID == "" || !isMember(userId, room.Members) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "Access Deny", "room_id": roomID})
+				continue
+			}
+			msg := h.hub.DB.MessageOps().GetMessageByUniqId(messageID)
+			if msg.ID == "" {
+				msg = h.hub.DB.MessageOps().GetMessageById(messageID)
+			}
+			if msg.ID == "" || (msg.RoomID != "" && msg.RoomID != roomID) {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "message not found", "room_id": roomID})
+				continue
+			}
+			reactions, err := h.hub.DB.MessageOps().ToggleReaction(msg.ID, roomID, userId, emoji)
+			if err != nil {
+				_ = writeConn.WriteJSON(map[string]interface{}{"event_type": "error", "content": "reaction failed", "room_id": roomID})
+				continue
+			}
+			key := msg.UniqId
+			if key == "" {
+				key = msg.ID
+			}
+			h.hub.fanoutReaction(roomID, key, reactions)
+			if h.hub.RedisBroker != nil {
+				h.hub.RedisBroker.PublishRoomEvent(&PubSubRoomEvent{
+					Type:      "message_reaction",
+					RoomID:    roomID,
+					MessageID: key,
+					Reactions: reactions,
+				})
+			}
 		case "roomHistory":
 			roomID := incoming.RoomID
 			page := incoming.Item
@@ -622,10 +809,11 @@ func (h *Handler) unifiedReader(rawConn *websocket.Conn, writeConn ConnWriter, c
 			if roomID == "" {
 				continue
 			}
-			messages := h.hub.DB.MessageOps().GetRoomMessage(roomID, page)
+			messages := h.hub.DB.MessageOps().RedactSecrets(h.hub.DB.MessageOps().GetRoomMessage(roomID, page), userId)
 			_ = writeConn.WriteJSON(map[string]interface{}{
 				"event_type": "roomHistory",
 				"room_id":    roomID,
+				"page":       page,
 				"content":    messages,
 			})
 		default:
@@ -890,6 +1078,15 @@ func (h *Handler) getUser(token string) (UserRequest, error) {
 
 	if h.mockOnly && h.MockUsers != nil {
 		if userRequest, ok := h.MockUsers[token]; ok {
+			if h.hub != nil && h.hub.DB != nil {
+				h.UpdateUser(UserDto{
+					UserId:    strconv.Itoa(userRequest.Id),
+					UserName:  userRequest.UserName,
+					FirstName: userRequest.FirstName,
+					LastName:  userRequest.LastName,
+					AvatarUrl: userRequest.Avatar,
+				})
+			}
 			return userRequest, nil
 		}
 		return user, errors.New("unauthorized: token not in mock users")
@@ -897,38 +1094,40 @@ func (h *Handler) getUser(token string) (UserRequest, error) {
 	h.userMu.RLock()
 	userRequest, cached := h.UserHandler[token]
 	h.userMu.RUnlock()
-	if cached && userRequest.Id != 0 {
+	if cached && userRequest.Id != 0 && userRequest.Time.After(time.Now()) {
 		return userRequest, nil
 	}
-	client := &http.Client{}
 	gateway := fmt.Sprintf("%s/api/auth/user", os.Getenv("GATEWAY_URL"))
 	request, err := http.NewRequest("GET", gateway, nil)
-	request.Header.Set("Authorization", token)
 	if err != nil {
-
 		return user, err
 	}
-	res, err := client.Do(request)
-
-	fmt.Println(res.StatusCode)
+	request.Header.Set("Authorization", token)
+	res, err := gatewayClient.Do(request)
+	if err != nil {
+		return user, err
+	}
 	if res == nil {
 		return user, errors.New("no response from gateway")
 	}
-	//if res.StatusCode != 200 {
-	//	user.LastStatusCode = res.StatusCode
-	//	user.Time = time.Now()
-	//	h.UserHandler[token] = user
-	//	return user, errors.New("server error")
-	//}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return user, errors.New("unauthorized")
+	}
 
-	body, _ := ioutil.ReadAll(res.Body)
-	err = json.Unmarshal(body, &user)
-
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
 		return user, err
 	}
+	err = json.Unmarshal(body, &user)
+	if err != nil {
+		return user, err
+	}
+	if user.Id == 0 {
+		return user, errors.New("unauthorized")
+	}
 	user.LastStatusCode = res.StatusCode
-	user.Time = time.Now()
+	user.Time = time.Now().Add(gatewayUserTTL)
 	h.userMu.Lock()
 	h.UserHandler[token] = user
 	h.userMu.Unlock()

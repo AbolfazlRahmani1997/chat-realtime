@@ -23,6 +23,11 @@ type MessageOps interface {
 	GetMessageByUniqId(uniqId string) Message
 	MessageDelivery(id string, clientIds []string) error
 	MessageRead(id string, clientIds []string) error
+	ToggleReaction(messageID, roomID, userID, emoji string) ([]Reaction, error)
+	EditMessage(id, content string) (Message, error)
+	SaveSecretAudience(messageID string, audience []string) error
+	ViewSecret(messageID, userID string) (content, state string, purgedNow bool, err error)
+	RedactSecrets(messages []Message, userID string) []Message
 	UpdateRoomById(id string, room Room)
 }
 

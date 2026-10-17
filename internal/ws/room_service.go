@@ -32,12 +32,31 @@ func (r RoomService) GetMyRoom(userId string, page string, filterType string) []
 	roomList := r.DB.RoomOps().GetMyRooms(userId, pageA, 10, filterType)
 
 	for _, room := range roomList {
-		roomSync := r.SyncUser(room)
+		// Member profiles are stored on the room. Syncing every member and
+		// writing the room back on each list call does not survive a login storm.
+		members := room.Members
+		if room.Type == PRIVATE && r.DB != nil {
+			members = append([]Member(nil), room.Members...)
+			for i := range members {
+				if members[i].Id == userId {
+					continue
+				}
+				profile := r.DB.UserOps().GetUser(members[i].Id)
+				if profile.Id == "" {
+					continue
+				}
+				members[i].FirstName = profile.FirstName
+				members[i].LastName = profile.LastName
+				if profile.AvatarUrl != "" {
+					members[i].AvatarUrl = profile.AvatarUrl
+				}
+			}
+		}
 		notDelivered := r.DB.MessageOps().GetMessageNotCountDelivery(room.ID, userId)
 		Rooms = append(Rooms, RoomResponse{
-			Id:                roomSync.ID,
-			Name:              roomSync.Name,
-			Members:           roomSync.Members,
+			Id:                room.ID,
+			Name:              room.Name,
+			Members:           members,
 			Status:            room.Status,
 			AvatarUrl:         room.AvatarUrl,
 			NotDeliverMessage: notDelivered,

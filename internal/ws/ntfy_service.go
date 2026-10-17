@@ -14,6 +14,7 @@ type NtfyService struct {
 	baseURL     string
 	topicPrefix string
 	client      *http.Client
+	jobs        chan *NtfyMessage
 }
 
 type NtfyMessage struct {
@@ -45,12 +46,28 @@ func NewNtfyService() *NtfyService {
 	if prefix == "" {
 		prefix = "chat"
 	}
-	return &NtfyService{
+	svc := &NtfyService{
 		baseURL:     baseURL,
 		topicPrefix: prefix,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        64,
+				MaxIdleConnsPerHost: 64,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
+		jobs: make(chan *NtfyMessage, 4096),
+	}
+	for i := 0; i < 8; i++ {
+		go svc.loop()
+	}
+	return svc
+}
+
+func (n *NtfyService) loop() {
+	for msg := range n.jobs {
+		n.deliver(msg)
 	}
 }
 
@@ -63,9 +80,17 @@ func (n *NtfyService) generalTopic() string {
 }
 
 func (n *NtfyService) send(msg *NtfyMessage) {
-	if n == nil {
+	if n == nil || msg == nil {
 		return
 	}
+	select {
+	case n.jobs <- msg:
+	default:
+		log.Printf("ntfy: queue full, dropped topic=%s", msg.Topic)
+	}
+}
+
+func (n *NtfyService) deliver(msg *NtfyMessage) {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("ntfy: marshal error: %v", err)

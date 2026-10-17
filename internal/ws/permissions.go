@@ -2,6 +2,15 @@ package ws
 
 import "strings"
 
+func allowedReaction(emoji string) bool {
+	switch emoji {
+	case "👍", "❤", "❤️", "😂", "😮", "😢", "🔥":
+		return true
+	default:
+		return false
+	}
+}
+
 func isMember(userID string, members []Member) bool {
 	for _, m := range members {
 		if m.Id == userID {

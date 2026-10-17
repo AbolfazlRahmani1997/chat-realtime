@@ -89,6 +89,13 @@ type ForwardInfo struct {
 	Username   string `json:"username"`
 }
 
+// Reaction is one emoji grouped across the users who set it on a message.
+type Reaction struct {
+	Emoji   string   `json:"emoji"`
+	Count   int      `json:"count"`
+	UserIDs []string `json:"user_ids"`
+}
+
 type Message struct {
 	ID           string       `json:"_id"`
 	Content      string       `json:"Content,omitempty"`
@@ -99,12 +106,15 @@ type Message struct {
 	ClientID     string       `json:"ClientID,omitempty"`
 	Deliver      []string     `json:"Deliver"`
 	Read         []string     `json:"Read"`
+	Reactions    []Reaction   `json:"Reactions,omitempty"`
 	ReplyTo      *ReplyInfo   `json:"ReplyTo,omitempty"`
 	ForwardFrom  *ForwardInfo `json:"ForwardFrom,omitempty"`
+	Edited       bool         `json:"Edited,omitempty"`
+	SecretState  string       `json:"SecretState,omitempty"`
 	connectionId string
 	remote       bool // set for cross-instance Redis fan-out; skip persist/re-publish
 	// cachedRoomJSON: pre-marshaled roomMessageOut for UnifiedConn fan-out (json omitted).
-	cachedRoomJSON []byte `json:"-"`
+	cachedRoomJSON []byte    `json:"-"`
 	CreatedAt      time.Time `json:"CreatedAt"`
 	UpdatedAt      time.Time `json:"UpdatedAt"`
 }
@@ -193,6 +203,27 @@ func (c *Client) trySendChanel(m *Message) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (c *Client) writeJSONAll(v interface{}) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	conns := make([]ConnWriter, 0, len(c.Conn))
+	for _, conn := range c.Conn {
+		if conn != nil {
+			conns = append(conns, conn)
+		}
+	}
+	c.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.WriteJSON(v)
 	}
 }
 

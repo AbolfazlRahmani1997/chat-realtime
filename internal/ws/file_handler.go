@@ -3,6 +3,7 @@ package ws
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -11,11 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/minio/minio-go/v7"
 	"github.com/oklog/ulid/v2"
 )
+
+const maxUploadBytes int64 = 20 << 20
 
 type uploadResponse struct {
 	FileID   string `json:"file_id"`
@@ -41,9 +45,18 @@ func safeBaseName(name string) string {
 // UploadFile stores a file (MinIO if configured, else local disk) and returns file_id.
 // Multipart field name: "file".
 func (h *Handler) UploadFile(c *gin.Context) {
+	if _, err := h.getUser(c.Query("token")); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	fh, err := c.FormFile("file")
 	if err != nil || fh == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file required"})
+		return
+	}
+	if fh.Size <= 0 || fh.Size > maxUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large"})
 		return
 	}
 
@@ -190,4 +203,75 @@ func (h *Handler) GetFile(c *gin.Context) {
 		return
 	}
 	c.File(p)
+}
+
+type fileMessageBody struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	Mime string `json:"mime,omitempty"`
+	Size int64  `json:"size,omitempty"`
+}
+
+func safeDisplayName(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	name = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." {
+		return "file"
+	}
+	if utf8.RuneCountInString(name) > 120 {
+		name = string([]rune(name)[:120])
+	}
+	return name
+}
+
+func uploadedFileExists(fileID string) bool {
+	fileID = safeBaseName(fileID)
+	if fileID == "" {
+		return false
+	}
+	cl, bucket, useMinio, err := minioEnsureClient()
+	if err != nil {
+		return false
+	}
+	if useMinio {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, statErr := cl.StatObject(ctx, bucket, minioObjectKey(fileID), minio.StatObjectOptions{})
+		return statErr == nil
+	}
+	st, statErr := os.Stat(filepath.Join(uploadDir(), fileID))
+	return statErr == nil && st != nil && !st.IsDir()
+}
+
+// normalizeFileMessage accepts a file message body that points at an uploaded object.
+func normalizeFileMessage(content string) (string, bool) {
+	var body fileMessageBody
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &body); err != nil {
+		return "", false
+	}
+	id := strings.TrimPrefix(body.URL, "/chat/files/")
+	if id == "" || strings.Contains(id, "/") || id != safeBaseName(id) {
+		return "", false
+	}
+	if !uploadedFileExists(id) {
+		return "", false
+	}
+	body.Name = safeDisplayName(body.Name)
+	body.URL = "/chat/files/" + id
+	if len(body.Mime) > 120 {
+		body.Mime = body.Mime[:120]
+	}
+	if body.Size < 0 {
+		body.Size = 0
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
 }

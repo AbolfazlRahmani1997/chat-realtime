@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,12 +29,15 @@ type PubSubMessage struct {
 }
 
 type PubSubRoomEvent struct {
-	Type     string `json:"type"`
-	RoomID   string `json:"room_id"`
-	UserID   string `json:"user_id,omitempty"`
-	Status   string `json:"status,omitempty"`
-	RoomData *Room  `json:"room_data,omitempty"`
-	SenderID string `json:"sender_id,omitempty"`
+	Type      string     `json:"type"`
+	RoomID    string     `json:"room_id"`
+	UserID    string     `json:"user_id,omitempty"`
+	Status    string     `json:"status,omitempty"`
+	RoomData  *Room      `json:"room_data,omitempty"`
+	SenderID  string     `json:"sender_id,omitempty"`
+	MessageID string     `json:"message_id,omitempty"`
+	Reactions []Reaction `json:"reactions,omitempty"`
+	Body      string     `json:"body,omitempty"`
 }
 
 type PubSubReadReceipt struct {
@@ -49,26 +53,34 @@ type RedisPubSubBroker struct {
 	ctx        context.Context
 	instanceID string
 	hub        *Hub
+	subMu      sync.Mutex
+	msgSubs    map[string]bool
 }
 
 func NewRedisPubSubBroker(hub *Hub, client *redis.Client) *RedisPubSubBroker {
-	instanceID := fmt.Sprintf("instance-%d", time.Now().UnixNano())
-	if hostname, err := os.Hostname(); err == nil {
-		instanceID = hostname
-	}
-
 	return &RedisPubSubBroker{
 		client:     client,
 		ctx:        context.Background(),
-		instanceID: instanceID,
+		instanceID: instanceIdentity(),
 		hub:        hub,
+		msgSubs:    make(map[string]bool),
 	}
+}
+
+func instanceIdentity() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "local"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 func (b *RedisPubSubBroker) Start() {
 	log.Printf("[redis-pubsub] starting redis pubsub with instanceID=%s", b.instanceID)
-	b.pubsub = b.client.Subscribe(b.ctx, PubSubChannelMessages, PubSubChannelRoomEvents, PubSubChannelReadReceipt)
-	ch := b.pubsub.Channel()
+	// Message traffic is sharded. This pod subscribes to a shard only after a
+	// local user watches a room on it, so it does not decode the whole cluster.
+	b.pubsub = b.client.Subscribe(b.ctx, PubSubChannelRoomEvents, PubSubChannelReadReceipt)
+	ch := b.pubsub.Channel(redis.WithChannelSize(8192))
 
 	go func() {
 		for msg := range ch {
@@ -110,6 +122,50 @@ func (b *RedisPubSubBroker) Close() {
 	}
 }
 
+func (b *RedisPubSubBroker) SubscribeMessages(channels []string) {
+	if b == nil || b.pubsub == nil || len(channels) == 0 {
+		return
+	}
+	b.subMu.Lock()
+	defer b.subMu.Unlock()
+	var fresh []string
+	for _, ch := range channels {
+		if ch == "" || b.msgSubs[ch] {
+			continue
+		}
+		b.msgSubs[ch] = true
+		fresh = append(fresh, ch)
+	}
+	if len(fresh) == 0 {
+		return
+	}
+	if err := b.pubsub.Subscribe(b.ctx, fresh...); err != nil {
+		log.Printf("redis pubsub: subscribe %v: %v", fresh, err)
+	}
+}
+
+func (b *RedisPubSubBroker) UnsubscribeMessages(channels []string) {
+	if b == nil || b.pubsub == nil || len(channels) == 0 {
+		return
+	}
+	b.subMu.Lock()
+	defer b.subMu.Unlock()
+	var drop []string
+	for _, ch := range channels {
+		if ch == "" || !b.msgSubs[ch] {
+			continue
+		}
+		delete(b.msgSubs, ch)
+		drop = append(drop, ch)
+	}
+	if len(drop) == 0 {
+		return
+	}
+	if err := b.pubsub.Unsubscribe(b.ctx, drop...); err != nil {
+		log.Printf("redis pubsub: unsubscribe %v: %v", drop, err)
+	}
+}
+
 func (b *RedisPubSubBroker) PublishMessage(roomID string, m *Message) {
 	pubMsg := PubSubMessage{
 		Type:      "new_message",
@@ -119,7 +175,7 @@ func (b *RedisPubSubBroker) PublishMessage(roomID string, m *Message) {
 		SenderID:  b.instanceID,
 	}
 	data, _ := json.Marshal(pubMsg)
-	err := b.client.Publish(b.ctx, PubSubChannelMessages, string(data)).Err()
+	err := b.client.Publish(b.ctx, messageChannel(roomID), data).Err()
 	if err != nil {
 		log.Printf("redis pubsub: failed to publish message: %v", err)
 	}
@@ -167,24 +223,49 @@ func (b *RedisPubSubBroker) handleIncomingMessage(pubMsg *PubSubMessage) {
 }
 
 func (b *RedisPubSubBroker) handleIncomingRoomEvent(event *PubSubRoomEvent) {
-	if b.hub == nil {
+	if b.hub == nil || event == nil {
+		return
+	}
+	if event.SenderID != "" && event.SenderID == b.instanceID {
 		return
 	}
 	switch event.Type {
 	case "room_created":
-		if event.RoomData != nil {
+		if event.RoomData == nil {
+			return
+		}
+		if b.hub.hasRoomWatchers(event.RoomID) {
 			b.hub.EnsureRoom(*event.RoomData)
+		}
+		for _, user := range b.hub.watchersExcept(event.RoomID, "") {
+			user.trySendCreateRoom(event.RoomData)
 		}
 
 	case "user_online":
-		if user, ok := b.hub.getUserLocked(event.UserID); ok && user != nil {
+		for _, user := range b.hub.watchersExcept(event.RoomID, event.UserID) {
 			user.trySendRoomStatus(&RoomStatus{RoomId: event.RoomID, Status: online})
 		}
 
 	case "user_offline":
-		if user, ok := b.hub.getUserLocked(event.UserID); ok && user != nil {
+		for _, user := range b.hub.watchersExcept(event.RoomID, event.UserID) {
 			user.trySendRoomStatus(&RoomStatus{RoomId: event.RoomID, Status: offline})
 		}
+
+	case "message_reaction":
+		reactions := event.Reactions
+		if reactions == nil {
+			reactions = []Reaction{}
+		}
+		b.hub.fanoutReaction(event.RoomID, event.MessageID, reactions)
+
+	case "message_edited":
+		b.hub.fanoutEdit(event.RoomID, event.MessageID, event.Body)
+
+	case "secret_viewed":
+		b.hub.fanoutSecret(event.RoomID, "secretViewed", event.MessageID, event.UserID)
+
+	case "secret_purged":
+		b.hub.fanoutSecret(event.RoomID, "secretPurged", event.MessageID, event.UserID)
 	}
 }
 

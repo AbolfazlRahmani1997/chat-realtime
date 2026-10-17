@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"log"
 	"strconv"
 	"time"
@@ -23,7 +24,14 @@ func (p *ScyllaProvider) UserOps() UserOps       { return p }
 // --- MessageOps ---
 
 func (p *ScyllaProvider) InsertMessage(message Message) {
-	p.InsertMessageFlat(message.ID, message.Content, message.Type, message.UniqId, message.RoomID, message.Username, message.ClientID, message.Deliver, message.Read, nil, nil, message.CreatedAt, message.UpdatedAt)
+	var forwardJSON *string
+	if message.ForwardFrom != nil {
+		if raw, err := json.Marshal(message.ForwardFrom); err == nil {
+			s := string(raw)
+			forwardJSON = &s
+		}
+	}
+	p.InsertMessageFlat(message.ID, message.Content, message.Type, message.UniqId, message.RoomID, message.Username, message.ClientID, message.Deliver, message.Read, nil, forwardJSON, message.CreatedAt, message.UpdatedAt)
 }
 
 func (p *ScyllaProvider) InsertMessageFlat(msgId string, content string, msgType string, uniqId string, roomID string, username string, clientID string, deliver []string, read []string, replyToJSON *string, forwardFromJSON *string, createdAt time.Time, updatedAt time.Time) {
@@ -59,6 +67,12 @@ func (p *ScyllaProvider) InsertMessageFlat(msgId string, content string, msgType
 	}
 	if err := p.Session.ExecuteBatch(b); err != nil {
 		log.Printf("Scylla InsertMessageFlat batch error: %v", err)
+	}
+	if forwardFromJSON != nil && *forwardFromJSON != "" {
+		_ = p.Session.Query(
+			`INSERT INTO message_meta (message_id, forward_from, edited) VALUES (?, ?, false)`,
+			id, *forwardFromJSON,
+		).Exec()
 	}
 }
 
@@ -151,7 +165,10 @@ func (p *ScyllaProvider) GetRoomMessage(roomId, page string) []Message {
 	if end > len(all) {
 		end = len(all)
 	}
-	return all[skip:end]
+	slice := all[skip:end]
+	p.attachReactions(slice)
+	p.attachMeta(slice)
+	return slice
 }
 
 func (p *ScyllaProvider) GetAllMessages(roomId, userId string) []Message {
@@ -281,6 +298,232 @@ func (p *ScyllaProvider) MessageRead(id string, clientIds []string) error {
 		b.Query(`INSERT INTO message_read (message_id, client_id) VALUES (?, ?)`, id, cid)
 	}
 	return p.Session.ExecuteBatch(b)
+}
+
+// EditMessage rewrites the text of a message the caller already authorized.
+func (p *ScyllaProvider) EditMessage(id, content string) (Message, error) {
+	msg := p.GetMessage(id)
+	if msg.ID == "" {
+		return Message{}, gocql.ErrNotFound
+	}
+	now := time.Now()
+	if err := p.Session.Query(
+		`UPDATE messages SET content = ?, updated_at = ? WHERE id = ?`,
+		content, now, id,
+	).Exec(); err != nil {
+		return Message{}, err
+	}
+	if err := p.Session.Query(
+		`UPDATE messages_by_room SET content = ? WHERE room_id = ? AND created_at = ? AND id = ?`,
+		content, msg.RoomID, msg.CreatedAt, id,
+	).Exec(); err != nil {
+		return Message{}, err
+	}
+	if err := p.Session.Query(
+		`UPDATE message_meta SET edited = true WHERE message_id = ?`,
+		id,
+	).Exec(); err != nil {
+		return Message{}, err
+	}
+	var lastID string
+	_ = p.Session.Query(`SELECT message_id FROM room_last_message WHERE room_id = ?`, msg.RoomID).Scan(&lastID)
+	msg.Content = content
+	msg.Edited = true
+	msg.UpdatedAt = now
+	if lastID == msg.ID || lastID == msg.UniqId {
+		p.LastMessage(msg.RoomID, msg)
+	}
+	return msg, nil
+}
+
+func (p *ScyllaProvider) SaveSecretAudience(messageID string, audience []string) error {
+	if messageID == "" {
+		return gocql.ErrNotFound
+	}
+	return p.Session.Query(
+		`INSERT INTO message_secrets (message_id, audience) VALUES (?, ?)`,
+		messageID, audience,
+	).Exec()
+}
+
+func (p *ScyllaProvider) ViewSecret(messageID, userID string) (content, state string, purgedNow bool, err error) {
+	msg := p.GetMessage(messageID)
+	if msg.ID == "" || msg.Type != MessageContentTypeSecret {
+		return "", "", false, gocql.ErrNotFound
+	}
+	var audience []string
+	if err = p.Session.Query(
+		`SELECT audience FROM message_secrets WHERE message_id = ?`,
+		msg.ID,
+	).Scan(&audience); err != nil {
+		return "", "", false, err
+	}
+	allowed := false
+	for _, id := range audience {
+		if id == userID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return "", "", false, gocql.ErrNotFound
+	}
+	if msg.Content == "" {
+		return "", SecretPurged, false, nil
+	}
+	var seen string
+	err = p.Session.Query(
+		`SELECT user_id FROM message_secret_views WHERE message_id = ? AND user_id = ?`,
+		msg.ID, userID,
+	).Scan(&seen)
+	if err == nil {
+		return "", SecretViewed, false, nil
+	}
+	if err != gocql.ErrNotFound {
+		return "", "", false, err
+	}
+	if err = p.Session.Query(
+		`INSERT INTO message_secret_views (message_id, user_id) VALUES (?, ?)`,
+		msg.ID, userID,
+	).Exec(); err != nil {
+		return "", "", false, err
+	}
+	viewed := map[string]bool{userID: true}
+	iter := p.Session.Query(
+		`SELECT user_id FROM message_secret_views WHERE message_id = ?`,
+		msg.ID,
+	).Iter()
+	var uid string
+	for iter.Scan(&uid) {
+		viewed[uid] = true
+	}
+	_ = iter.Close()
+	all := len(audience) > 0
+	for _, id := range audience {
+		if !viewed[id] {
+			all = false
+			break
+		}
+	}
+	if all {
+		_ = p.Session.Query(`UPDATE messages SET content = ? WHERE id = ?`, "", msg.ID).Exec()
+		_ = p.Session.Query(
+			`UPDATE messages_by_room SET content = ? WHERE room_id = ? AND created_at = ? AND id = ?`,
+			"", msg.RoomID, msg.CreatedAt, msg.ID,
+		).Exec()
+		return msg.Content, SecretLocked, true, nil
+	}
+	return msg.Content, SecretLocked, false, nil
+}
+
+func (p *ScyllaProvider) RedactSecrets(messages []Message, userID string) []Message {
+	for i := range messages {
+		if messages[i].Type != MessageContentTypeSecret {
+			continue
+		}
+		plain := messages[i].Content
+		messages[i].Content = ""
+		if plain == "" {
+			messages[i].SecretState = SecretPurged
+			continue
+		}
+		var seen string
+		err := p.Session.Query(
+			`SELECT user_id FROM message_secret_views WHERE message_id = ? AND user_id = ?`,
+			messages[i].ID, userID,
+		).Scan(&seen)
+		if err == nil {
+			messages[i].SecretState = SecretViewed
+			continue
+		}
+		messages[i].SecretState = SecretLocked
+	}
+	return messages
+}
+
+func (p *ScyllaProvider) attachMeta(messages []Message) {
+	for i := range messages {
+		var forwardFrom string
+		var edited bool
+		err := p.Session.Query(
+			`SELECT forward_from, edited FROM message_meta WHERE message_id = ?`,
+			messages[i].ID,
+		).Scan(&forwardFrom, &edited)
+		if err != nil {
+			continue
+		}
+		messages[i].Edited = edited
+		if forwardFrom == "" {
+			continue
+		}
+		var info ForwardInfo
+		if json.Unmarshal([]byte(forwardFrom), &info) == nil {
+			messages[i].ForwardFrom = &info
+		}
+	}
+}
+
+// ToggleReaction sets one emoji per user. Sending the same emoji again removes it.
+func (p *ScyllaProvider) ToggleReaction(messageID, roomID, userID, emoji string) ([]Reaction, error) {
+	var current string
+	err := p.Session.Query(
+		`SELECT emoji FROM message_reactions WHERE message_id = ? AND user_id = ?`,
+		messageID, userID,
+	).Scan(&current)
+	if err != nil && err != gocql.ErrNotFound {
+		return nil, err
+	}
+	if err == nil && (emoji == "" || current == emoji) {
+		if err := p.Session.Query(
+			`DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?`,
+			messageID, userID,
+		).Exec(); err != nil {
+			return nil, err
+		}
+	} else if emoji != "" {
+		if err := p.Session.Query(
+			`INSERT INTO message_reactions (message_id, user_id, emoji, room_id) VALUES (?, ?, ?, ?)`,
+			messageID, userID, emoji, roomID,
+		).Exec(); err != nil {
+			return nil, err
+		}
+	}
+	return p.reactionsFor(messageID), nil
+}
+
+func (p *ScyllaProvider) attachReactions(messages []Message) {
+	for i := range messages {
+		messages[i].Reactions = p.reactionsFor(messages[i].ID)
+	}
+}
+
+func (p *ScyllaProvider) reactionsFor(messageID string) []Reaction {
+	iter := p.Session.Query(
+		`SELECT user_id, emoji FROM message_reactions WHERE message_id = ?`,
+		messageID,
+	).Iter()
+	grouped := map[string]*Reaction{}
+	order := make([]string, 0)
+	var userID, emoji string
+	for iter.Scan(&userID, &emoji) {
+		if emoji == "" {
+			continue
+		}
+		group, ok := grouped[emoji]
+		if !ok {
+			group = &Reaction{Emoji: emoji, UserIDs: []string{}}
+			grouped[emoji] = group
+			order = append(order, emoji)
+		}
+		group.UserIDs = append(group.UserIDs, userID)
+		group.Count = len(group.UserIDs)
+	}
+	_ = iter.Close()
+	out := make([]Reaction, 0, len(order))
+	for _, emoji := range order {
+		out = append(out, *grouped[emoji])
+	}
+	return out
 }
 
 func (p *ScyllaProvider) UpdateRoomById(id string, room Room) {

@@ -405,6 +405,34 @@ func (p *MongoProvider) MessageRead(id string, clientIds []string) error {
 	return err
 }
 
+func (p *MongoProvider) ToggleReaction(messageID, roomID, userID, emoji string) ([]Reaction, error) {
+	return []Reaction{}, nil
+}
+
+func (p *MongoProvider) EditMessage(id, content string) (Message, error) {
+	return Message{}, nil
+}
+
+func (p *MongoProvider) SaveSecretAudience(messageID string, audience []string) error {
+	return nil
+}
+
+func (p *MongoProvider) ViewSecret(messageID, userID string) (string, string, bool, error) {
+	return "", "", false, nil
+}
+
+func (p *MongoProvider) RedactSecrets(messages []Message, userID string) []Message {
+	for i := range messages {
+		if messages[i].Type == MessageContentTypeSecret {
+			messages[i].Content = ""
+			if messages[i].SecretState == "" {
+				messages[i].SecretState = SecretLocked
+			}
+		}
+	}
+	return messages
+}
+
 func (p *MongoProvider) UpdateRoomById(id string, room Room) {
 	members := make([]bson.M, len(room.Members))
 	for i, m := range room.Members {
